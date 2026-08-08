@@ -23,11 +23,15 @@ CORRELATION -- and its limits, stated plainly:
     normals are mixed through the Cholesky factor of the input correlation
     matrix, pushed through the normal CDF to uniforms, then inverted through
     each channel's Beta marginal.
-  * The input matrix is the correlation of daily *revenue*, used here as a
-    proxy for CVR co-movement. Revenue correlation bundles CVR, CPC and
-    revenue-per-conversion co-movement together, so attributing all of it to
-    CVR overstates CVR correlation somewhat. Deriving a dedicated CVR
-    correlation matrix in bronze is the clean fix; noted, not built.
+  * The input matrix is `bronze.channel_cvr_correlation_matrix` -- Pearson
+    correlation measured directly on daily CVR, which is the quantity actually
+    being correlated here.
+    Phase 2 originally used the daily-*revenue* matrix as a proxy. That bundles
+    CTR, CVR and revenue-per-conversion co-movement together, and empirically
+    it UNDERstates CVR correlation (mean off-diagonal 0.371 vs 0.406): revenue
+    carries a large independent per-channel revenue-per-conversion noise term
+    that dilutes the shared macro signal, while CVR does not. The revenue
+    matrix stays in bronze as a diagnostic but no longer feeds the simulation.
   * CPC and revenue-per-conversion are drawn INDEPENDENTLY across channels.
     Correlating them too is a reasonable extension, deliberately out of scope.
   * A Gaussian copula transmits rank correlation, so the Pearson correlation

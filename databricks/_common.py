@@ -29,7 +29,13 @@ BRONZE = f"{CATALOG}.bronze"
 
 TBL_HISTORY = f"{BRONZE}.channel_performance_history"
 TBL_ASSUMPTIONS = f"{BRONZE}.channel_assumptions"
+# Revenue-based correlation. Retained as a diagnostic / reference: it is the
+# correlation of the business outcome, but it bundles CTR, CVR, CPC and
+# revenue-per-conversion co-movement together.
 TBL_CORRELATION = f"{BRONZE}.channel_correlation_matrix"
+# CVR-specific correlation. This is what the simulation's Cholesky step wants,
+# since CVR is the only quantity correlated across channels.
+TBL_CVR_CORRELATION = f"{BRONZE}.channel_cvr_correlation_matrix"
 
 # UC volume used purely as a landing zone for the raw CSV
 LANDING_VOLUME = f"{CATALOG}.bronze.landing"

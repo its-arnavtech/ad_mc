@@ -23,8 +23,27 @@ Produces three Delta tables in `ad_mc_poc.bronze`:
 | table | grain | contents |
 |---|---|---|
 | `channel_performance_history` | date x channel | date, channel_id, impressions, clicks, conversions, spend, revenue |
-| `channel_assumptions` | channel | mean/std of CTR, CVR, revenue-per-conversion + distribution_type |
-| `channel_correlation_matrix` | channel pair | Pearson correlation of daily revenue |
+| `channel_assumptions` | channel | mean/std of CTR, CPC, CVR, revenue-per-conversion + distribution_type |
+| `channel_correlation_matrix` | channel pair | Pearson correlation of daily **revenue** -- diagnostic only |
+| `channel_cvr_correlation_matrix` | channel pair | Pearson correlation of daily **CVR** -- drives the simulation |
+
+### Two correlation matrices, and why
+
+Revenue = clicks x CVR x revenue-per-conversion, so a revenue correlation
+bundles CTR, CVR and revenue-per-conversion co-movement together. The
+simulation's Cholesky step correlates **CVR only**, so it needs correlation
+measured on CVR. Both are kept: the CVR matrix feeds the engine, the revenue
+matrix stays as a business-level diagnostic. Switch between them with
+`CORRELATION_SOURCE` in `simulation/config.py`.
+
+Measured on this dataset the revenue matrix **understates** CVR correlation
+(mean off-diagonal 0.371 vs 0.406, higher on 18 of 20 pairs), because the
+large independent per-channel revenue-per-conversion noise dilutes the shared
+macro signal that CVR carries cleanly.
+
+Days with zero clicks leave CVR undefined; those channel-days are excluded
+pairwise rather than imputed. On the current 730-day dataset there are **none**,
+so every pair uses all 730 observations.
 
 ### 1. Generate the data locally
 
@@ -130,10 +149,6 @@ Per path, per channel: `clicks = spend / CPC`, `conversions = clicks * CVR`,
 - **Only CVR is correlated.** CPC and revenue-per-conversion are drawn
   independently across channels. Correlating them is a reasonable extension,
   deliberately not built.
-- **The correlation matrix is a proxy.** It is the correlation of daily
-  *revenue*, which bundles CVR, CPC and revenue-per-conversion co-movement
-  together; attributing all of it to CVR overstates CVR correlation. The clean
-  fix is a dedicated CVR correlation matrix in bronze.
 - **A Gaussian copula transmits rank correlation**, so the Pearson correlation
   of the resulting Beta draws is slightly attenuated relative to the input.
   Small and expected -- not a Cholesky failure.

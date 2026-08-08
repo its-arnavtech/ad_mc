@@ -16,13 +16,19 @@ import numpy as np
 
 from config import (
     ALLOCATION_STRATEGY,
+    CORRELATION_SOURCE,
     N_PATHS,
     RANDOM_SEED,
     SCENARIO,
     TOTAL_BUDGET,
     build_allocation,
 )
-from data_access import load_assumptions, load_correlation_matrix, open_session
+from data_access import (
+    CORRELATION_TABLES,
+    load_assumptions,
+    load_correlation_matrix,
+    open_session,
+)
 from engine import (
     jensen_corrected_expectation,
     naive_point_estimate,
@@ -56,7 +62,7 @@ def main() -> None:
     w, warehouse_id = open_session()
     assumptions = load_assumptions(w, warehouse_id)
     channels = assumptions["channel_id"].tolist()
-    correlation = load_correlation_matrix(w, warehouse_id, channels)
+    correlation = load_correlation_matrix(w, warehouse_id, channels, CORRELATION_SOURCE)
     allocation = build_allocation(channels, ALLOCATION_STRATEGY, TOTAL_BUDGET)
 
     print(f"\nscenario          : {SCENARIO} (no macro multipliers applied)")
@@ -66,8 +72,9 @@ def main() -> None:
     print(f"allocation        : {ALLOCATION_STRATEGY} -> "
           f"{money(TOTAL_BUDGET / len(channels))} x {len(channels)} channels")
     print(f"channels          : {channels}")
-    print(f"correlation source: bronze.channel_correlation_matrix "
-          f"(daily-revenue proxy, {correlation.shape[0]}x{correlation.shape[1]})")
+    corr_table = CORRELATION_TABLES[CORRELATION_SOURCE].split(".")[-1]
+    print(f"correlation source: {CORRELATION_SOURCE} -> bronze.{corr_table} "
+          f"({correlation.shape[0]}x{correlation.shape[1]})")
 
     print("\n-- assumptions read from bronze --")
     show = assumptions[["channel_id", "mean_cpc", "std_cpc", "mean_cvr", "std_cvr",

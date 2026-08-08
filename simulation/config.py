@@ -16,6 +16,14 @@ ALLOCATION_STRATEGY = "even_split"
 N_PATHS = 10_000
 RANDOM_SEED = 20260808  # fixed so the run is reproducible; change to resample
 
+# --- Correlation source -----------------------------------------------------
+# "cvr"     -> bronze.channel_cvr_correlation_matrix  (correct: CVR is the only
+#              quantity the Cholesky step correlates, so the matrix should be
+#              measured on CVR)
+# "revenue" -> bronze.channel_correlation_matrix      (the original Phase 2
+#              proxy; retained so the two can be compared directly)
+CORRELATION_SOURCE = "cvr"
+
 # --- Scenario ---------------------------------------------------------------
 # Phase 2 is "normal" only: no macro multipliers applied anywhere. Scenario
 # overlays (recession / boom / seasonal) are Phase 4 work. The constant is
