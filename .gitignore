@@ -1,0 +1,27 @@
+# --- Secrets: never commit credentials ---
+.env
+.env.*
+*.env
+!.env.example
+.databrickscfg
+*.pem
+*.token
+secrets.json
+
+# --- Generated data ---
+# The CSV is fully reproducible via:
+#   python data_generation/generate_channel_data.py --start-date 2024-01-01 --days 730 --seed 42
+data/raw/*.csv
+data/processed/
+!data/raw/.gitkeep
+
+# --- Validation output ---
+data/validation/*.png
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.pytest_cache/

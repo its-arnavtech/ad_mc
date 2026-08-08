@@ -1,0 +1,10 @@
+# Local data generation (Phase 1, step 1)
+numpy>=1.26
+pandas>=2.1
+
+# Databricks control plane: catalog/schema DDL, file upload, SQL execution
+# (Statement Execution API -- no cluster or databricks-connect required)
+databricks-sdk>=0.30
+
+# Validation reporting (step 6: correlation heatmap)
+matplotlib>=3.8
