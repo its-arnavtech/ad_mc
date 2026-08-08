@@ -82,8 +82,9 @@ def main() -> None:
     print("\n== 2. Null scan ==")
     table_cols = {
         TBL_HISTORY: ["date", "channel_id", "impressions", "clicks", "conversions", "spend", "revenue"],
-        TBL_ASSUMPTIONS: ["channel_id", "channel_name", "mean_ctr", "std_ctr", "mean_cvr", "std_cvr",
-                          "mean_revenue_per_conversion", "std_revenue_per_conversion", "distribution_type"],
+        TBL_ASSUMPTIONS: ["channel_id", "channel_name", "mean_ctr", "std_ctr", "mean_cpc", "std_cpc",
+                          "mean_cvr", "std_cvr", "mean_revenue_per_conversion",
+                          "std_revenue_per_conversion", "distribution_type"],
         TBL_CORRELATION: ["channel_id_a", "channel_id_b", "correlation_coefficient"],
     }
     for table, columns in table_cols.items():
@@ -123,9 +124,19 @@ def main() -> None:
         SELECT COUNT(*) FROM {TBL_ASSUMPTIONS}
         WHERE mean_ctr <= 0 OR mean_ctr >= 1 OR mean_cvr <= 0 OR mean_cvr >= 1
            OR std_ctr < 0 OR std_cvr < 0
+           OR mean_cpc <= 0 OR std_cpc < 0
            OR mean_revenue_per_conversion <= 0 OR std_revenue_per_conversion < 0
     """)[0])
     check("assumption means/stds inside plausible bounds", out_of_range == 0, f"{out_of_range} bad rows")
+
+    # Beta method-of-moments needs var < mean*(1-mean); if this fails the
+    # Phase 2 CVR fit is impossible, so catch it here rather than at sim time.
+    beta_infeasible = int(scalar(w, wid, f"""
+        SELECT COUNT(*) FROM {TBL_ASSUMPTIONS}
+        WHERE POWER(std_cvr, 2) >= mean_cvr * (1 - mean_cvr)
+    """)[0])
+    check("CVR admits a Beta method-of-moments fit", beta_infeasible == 0,
+          f"{beta_infeasible} channels with var >= mean*(1-mean)")
 
     # ---- 4. correlation matrix well-formedness -----------------------------
     print("\n== 4. Correlation matrix ==")

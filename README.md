@@ -85,7 +85,63 @@ Documented at the top of `databricks/03_build_assumptions.py`, briefly:
 - Daily ratios are averaged across days (mean-of-ratios), so each day counts
   equally; `std_*` are sample standard deviations.
 
+## Phase 2 -- Single-node simulation engine
+
+Proves the correlated Monte Carlo logic by hand, on one node, before Phase 3
+distributes it. No Spark, no Workflows, no MLflow. Output is local only
+(printed stats + a saved histogram) -- persisting results starts in Phase 3.
+
+```bash
+python simulation/run_phase2_simulation.py
+```
+
+```
+simulation/config.py                  budget, allocation strategy, paths, seed, scenario
+simulation/engine.py                  pure math -- no I/O, deterministic given a seed
+simulation/data_access.py             reads the bronze assumption tables
+simulation/run_phase2_simulation.py   runs one simulation and validates it
+```
+
+### The CPC gap
+
+Phase 1's `channel_assumptions` carried CTR, which maps impressions -> clicks
+-- the historical generator's direction. Simulating *forward* from a dollar
+allocation needs the opposite: cost per click. `mean_cpc` / `std_cpc` were
+added as **columns on `channel_assumptions`** rather than a companion table,
+because they are the same grain (one row per channel) and the same kind of
+thing (a distribution parameter the simulation draws from); a separate table
+would force a join for no benefit. Derived from daily `spend / clicks` with
+the same mean-of-ratios / sample-stddev treatment as the existing columns.
+CTR stays in the table as a historical diagnostic and is unused in Phase 2.
+
+### Model
+
+Per path, per channel: `clicks = spend / CPC`, `conversions = clicks * CVR`,
+`revenue = conversions * revenue_per_conversion`.
+
+| quantity | marginal | fitted by | correlated? |
+|---|---|---|---|
+| CVR | Beta | method of moments | **yes** -- Gaussian copula via Cholesky |
+| CPC | LogNormal | method of moments | no |
+| revenue per conversion | LogNormal | method of moments | no |
+
+### Simplifications, stated explicitly
+
+- **Only CVR is correlated.** CPC and revenue-per-conversion are drawn
+  independently across channels. Correlating them is a reasonable extension,
+  deliberately not built.
+- **The correlation matrix is a proxy.** It is the correlation of daily
+  *revenue*, which bundles CVR, CPC and revenue-per-conversion co-movement
+  together; attributing all of it to CVR overstates CVR correlation. The clean
+  fix is a dedicated CVR correlation matrix in bronze.
+- **A Gaussian copula transmits rank correlation**, so the Pearson correlation
+  of the resulting Beta draws is slightly attenuated relative to the input.
+  Small and expected -- not a Cholesky failure.
+- **`distribution_type` still describes only revenue-per-conversion.** The row
+  now carries three distributions but one type column. Phase 2's families come
+  from the spec, not that column, so it stays descriptive-only.
+
 ## Later phases (not started)
 
-Simulation engine, Workflows orchestration, and MLflow instrumentation are out
-of scope until the bronze layer is signed off.
+Distributing the simulation across a cluster, Workflows orchestration, and
+MLflow instrumentation are out of scope until Phase 2 is signed off.

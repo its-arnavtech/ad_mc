@@ -6,5 +6,8 @@ pandas>=2.1
 # (Statement Execution API -- no cluster or databricks-connect required)
 databricks-sdk>=0.30
 
-# Validation reporting (step 6: correlation heatmap)
+# Phase 2 simulation engine: Beta/LogNormal fitting, normal CDF for the copula
+scipy>=1.11
+
+# Validation reporting: correlation heatmap, revenue histogram
 matplotlib>=3.8

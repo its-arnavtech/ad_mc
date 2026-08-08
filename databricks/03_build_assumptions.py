@@ -18,9 +18,18 @@ Assumptions baked in here -- change them in one place if you disagree:
   * `channel_name` is derived by title-casing `channel_id` ("paid_search" ->
     "Paid Search"). The CSV carries no display-name column; if you have real
     names, this is the line to change.
-  * `distribution_type` describes the REVENUE-PER-CONVERSION marginal (the
-    quantity the simulation samples). It is chosen from observed skewness
-    rather than hardcoded: skew > 0.5 -> 'lognormal', else 'normal'.
+  * `distribution_type` describes the REVENUE-PER-CONVERSION marginal. It is
+    chosen from observed skewness rather than hardcoded: skew > 0.5 ->
+    'lognormal', else 'normal'. NOTE: as of Phase 2 the row carries three
+    distributions (CPC, CVR, revenue-per-conversion) but only this one
+    type column. Phase 2's families are specified by the simulation spec,
+    not read from here, so the column stays descriptive-only. If a later
+    phase wants to drive families from data, this needs splitting into
+    per-quantity type columns.
+  * `mean_cpc` / `std_cpc` are derived from daily `spend / clicks`. CPC is
+    what the forward simulation needs: it maps a dollar allocation to clicks.
+    CTR maps impressions -> clicks, which is the historical generator's
+    direction, and is retained as a diagnostic only.
   * Daily ratios are computed per day and then averaged across days
     (mean-of-ratios, not ratio-of-totals), so each day is weighted equally.
     Rows with a zero denominator are excluded from the relevant statistic.
@@ -59,6 +68,7 @@ def main() -> None:
             SELECT
                 channel_id,
                 CASE WHEN impressions > 0 THEN clicks      / impressions END AS ctr,
+                CASE WHEN clicks      > 0 THEN spend       / clicks      END AS cpc,
                 CASE WHEN clicks      > 0 THEN conversions / clicks      END AS cvr,
                 CASE WHEN conversions > 0 THEN revenue     / conversions END AS revenue_per_conversion
             FROM {TBL_HISTORY}
@@ -68,6 +78,8 @@ def main() -> None:
             INITCAP(REPLACE(channel_id, '_', ' '))          AS channel_name,
             AVG(ctr)                                        AS mean_ctr,
             STDDEV_SAMP(ctr)                                AS std_ctr,
+            AVG(cpc)                                        AS mean_cpc,
+            STDDEV_SAMP(cpc)                                AS std_cpc,
             AVG(cvr)                                        AS mean_cvr,
             STDDEV_SAMP(cvr)                                AS std_cvr,
             AVG(revenue_per_conversion)                     AS mean_revenue_per_conversion,
