@@ -26,6 +26,7 @@ from databricks.sdk.service.sql import StatementState
 CATALOG = "ad_mc_poc"
 SCHEMAS = ("bronze", "silver", "gold")
 BRONZE = f"{CATALOG}.bronze"
+SILVER = f"{CATALOG}.silver"
 
 TBL_HISTORY = f"{BRONZE}.channel_performance_history"
 TBL_ASSUMPTIONS = f"{BRONZE}.channel_assumptions"
@@ -36,6 +37,18 @@ TBL_CORRELATION = f"{BRONZE}.channel_correlation_matrix"
 # CVR-specific correlation. This is what the simulation's Cholesky step wants,
 # since CVR is the only quantity correlated across channels.
 TBL_CVR_CORRELATION = f"{BRONZE}.channel_cvr_correlation_matrix"
+
+# --- Phase 3 (distributed batch simulation) ---------------------------------
+# Macro scenario overlays (multipliers on the Phase 1 assumptions). Bronze
+# because it is hand-authored reference input, not something derived from
+# channel_performance_history.
+TBL_SCENARIOS = f"{BRONZE}.scenario_definitions"
+# The candidate budget splits the simulation sweeps over, long form:
+# one row per (allocation_id, channel_id).
+TBL_ALLOCATION_CANDIDATES = f"{SILVER}.allocation_candidates"
+# Path-level simulation output: one row per (allocation_id, scenario_id,
+# path_number). This is the big one Phase 4 aggregates.
+TBL_SIMULATED_OUTCOMES = f"{SILVER}.simulated_allocation_outcomes"
 
 # UC volume used purely as a landing zone for the raw CSV
 LANDING_VOLUME = f"{CATALOG}.bronze.landing"

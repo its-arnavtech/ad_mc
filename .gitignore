@@ -23,5 +23,12 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+# Phase 3 only: an isolated Python 3.12 env for databricks-connect. It exists
+# because applyInPandas ships pickled UDFs to the cluster, which requires the
+# client Python minor version to match the runtime's (DBR 16.4 -> 3.12), while
+# the rest of the repo runs on the local 3.13. Recreate with:
+#   uv venv --python 3.12 .venv-spark
+#   uv pip install --python ./.venv-spark/Scripts/python.exe -r requirements-spark.txt
+.venv-spark/
 .ipynb_checkpoints/
 .pytest_cache/

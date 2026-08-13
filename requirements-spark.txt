@@ -1,0 +1,33 @@
+# Phase 3 ONLY -- the isolated client env for distributing the simulation.
+#
+# Why this file is separate from requirements.txt
+# -----------------------------------------------
+# Phases 1-2 talk to Databricks purely over the Statement Execution API, so
+# they need no cluster and no Spark client, and they run on the machine's
+# default Python (3.13). Phase 3 runs `applyInPandas`, which ships a pickled
+# Python UDF to the cluster's Python workers. That imposes a constraint the
+# rest of the repo does not have:
+#
+#   the CLIENT Python minor version must match the CLUSTER runtime's.
+#
+# DBR 16.4 LTS ships Python 3.12, so the Phase 3 client must be 3.12 -- hence
+# a dedicated interpreter rather than the repo default.
+#
+# Recreate it with:
+#   uv venv --python 3.12 .venv-spark
+#   uv pip install --python ./.venv-spark/Scripts/python.exe -r requirements-spark.txt
+#
+# Then run Phase 3 scripts with .venv-spark/Scripts/python.exe, not `python`.
+
+# Pinned to the cluster's runtime major.minor. databricks-connect must not be
+# newer than the DBR it talks to.
+databricks-connect==16.4.*
+
+# Same control-plane SDK the rest of the repo uses, for resolving the cluster.
+databricks-sdk>=0.30
+
+# The simulation engine's own dependencies -- these must also be importable
+# INSIDE the UDF on the cluster, where DBR supplies its own copies.
+numpy>=1.26
+scipy>=1.11
+pandas>=2.1
