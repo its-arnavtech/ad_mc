@@ -90,9 +90,107 @@ Structured to demonstrate three roles in one system:
   `normal`'s multipliers are exactly 1.0 and `engine.simulate()` is called
   unmodified, preserving its RNG draw order.
 
+  **RUN COMPLETE — silver populated by the cluster.** 840,000 rows
+  (21 x 4 x 10,000) written by `applyInPandas` on serverless job compute.
+  Module distribution to executors is via a WHEEL built from the repo's own
+  files (version carries a content hash) named in the serverless environment
+  spec — not `sys.path` hacking, which imports fine on the driver and then
+  fails on executors. Write is `INSERT OVERWRITE` (not append, not
+  `saveAsTable`): the table has no `run_id`, so append would stack a second
+  grid that Phase 4 would silently average, and `saveAsTable` would discard
+  the column comments by rewriting table metadata.
+
+  **Reproduction result, stated precisely** — two different claims. (These
+  figures are the CORRECTED ones; see "verifier corrections" below for what
+  they replace and why.)
+  - *Exactness of the wrap, cluster vs local at the pinned seed 20260808:*
+    the cluster produces mean 968027.4399933233, std 169363.86043850295,
+    VaR-95 715966.1342067234 — which reproduces Phase 2's committed record
+    ($968,027 / $169,364 / $715,966) exactly at the precision Phase 2 actually
+    recorded. Aggregates are **bitwise identical across environments**:
+    three interpreters spanning scipy 1.15.1 → 1.18.0 and numpy 1.26.4 → 2.5.1
+    all return the same mean and std to all 17 digits, and `math.fsum` (exact
+    summation) confirms ...233 is the true mean of the vector.
+    Individual PATHS do drift across environments — cluster vs local differs on
+    7,843 of 10,000 paths, max abs 4.19e-09, max REL 3.06e-15, consistent with
+    `scipy.stats.beta.ppf` moving in the last ulp while NumPy's PCG64 stream
+    stays version-stable. Those perturbations cancel exactly in the aggregates.
+    So: paths are near-exact, aggregates are exact.
+  - *In-grid statistical agreement at the derived seed:* the grid's own
+    (even_split, normal) cell gives mean $972,326 / std $172,945 /
+    VaR-95 $710,953 / CVaR-95 $660,662. Against Phase 2's draw the correct
+    comparison uses the SE of the DIFFERENCE of two independent estimates
+    (sqrt(1729.45² + 1693.64²) = 2420.62), giving **+1.78 SE, p = 0.076** —
+    not the +2.49 SE that an SE-of-one-estimate comparison would suggest.
+    Sharper still, both draws can be scored against the exact analytic Jensen
+    target $971,112.25: Phase 2 sits at −1.82 SE, the grid draw at +0.70 SE,
+    so they straddle the truth and the grid draw is the more accurate of the
+    two. Across all 21 allocations under `normal`, mean z = +0.209 with 1 of
+    21 outside |1.96| — a textbook null, no systematic effect.
+
+  **Sanity checks at scale, all PASS:** exactly 840,000 rows and exactly
+  10,000 per cell across all 84 pairs; path_number 0..9999; zero nulls in
+  every column; no non-positive spend, no negative revenue; every
+  `total_spend` == $500,000; `max|roas - revenue/spend| == 0.0`; no duplicate
+  (allocation, scenario, path) keys; all 21 allocations and 4 scenarios
+  present; recession < normal for all 21 allocations (zero exceptions, ratios
+  0.819893 to 0.828342).
+
+  **Scenario means vs predicted `net_revenue_factor` — state the grain.**
+  POOLED across all 21 allocations the ratios hold to <= 9.4e-04 relative
+  (1.055006 / 0.756754 / 0.823136 vs 1.0560 / 0.7572727 / 0.8231707). At the
+  `even_split` allocation alone: seasonal_peak 1.054681 (1.25e-03),
+  platform_algo_change 0.754992 (**3.01e-03**), recession 0.822662 (6.18e-04).
+  Per INDIVIDUAL (allocation, scenario) cell the spread is wider still —
+  18 of 63 exceed 3.0e-3, worst 9.24e-03 (heavy_paid_search /
+  platform_algo_change). That is ordinary Monte Carlo noise: the ratio of two
+  means has a relative SE around 0.25%. Do not quote a single tight bound
+  without saying which grain it applies to.
+
+  **Honest scale note:** the full 84-cell grid runs in **7.4s** single-threaded
+  locally (timed). Spark here demonstrates the distribution mechanism; it is
+  not required by the workload size.
+
   **Known limits carried forward, deliberately not fixed here:** correlation is
   held fixed across scenarios, so recession tail risk is understated (real
   cross-channel correlation rises in a downturn); only CVR is correlated at all.
+
+  **`verifier` (2026-08-13) against live Databricks — PASS on data, PARTIAL on
+  the original prose.** Clean: engine byte-unchanged from `bcfeba3`
+  (`git diff` empty; the whole phase is 3,900 insertions and 0 deletions),
+  reference data, silver at scale, seeding, git hygiene, no secrets in any of
+  the 7 commits. It independently confirmed three things that had only been
+  asserted: (a) it downloaded the actual wheel from the UC volume and
+  byte-diffed all 6 modules against git — `engine.py` is byte-identical to
+  `bcfeba3`, and the content hash recomputes to the filename's
+  `0.1.0.post2213007160`, so the cluster provably ran the committed code;
+  (b) `INSERT OVERWRITE` idempotency is empirical, not theoretical — Delta
+  history shows two real runs (v15, v16) both at 840,000 rows, never doubling,
+  with `VERSION AS OF 15 EXCEPT VERSION AS OF 16` returning 0 rows;
+  (c) it re-ran 7 grid cells locally at their derived seeds and matched the
+  stored rows to max rel 6.6e-15, with negative controls that correctly fail.
+
+  It also caught four prose errors in the original Phase 3 writeup, all since
+  corrected above — the CODE AND DATA WERE ALWAYS CORRECT:
+  1. A **false causal claim** that scipy version drift caused a 1.6e-9 gap.
+     Three environments spanning scipy 1.15.1 → 1.18.0 give bitwise-identical
+     aggregates; the truth is stronger than what was claimed.
+  2. The 17-digit figure `968027.4399933217`, cited as Phase 2's mean,
+     **is not reproducible in any environment** and appears nowhere in the repo
+     outside that line. It originated in a session report, not Phase 2's
+     committed record, which states dollar precision ($968,027) and matches
+     exactly. `math.fsum` proves ...233 is the true mean. Do not re-introduce
+     the ...217 figure.
+  3. `+2.49 SE` used the SE of one estimate instead of the SE of the
+     difference; the correct value is +1.78 SE.
+  4. The `<= 3.0e-3` ratio bound was breached by one of its own quoted numbers
+     and by 18 of 63 cells; it holds only pooled across allocations.
+  Plus: grid runtime is 7.4s not ~15s, and the "100% paid_search" optimum was
+  extrapolation rather than measurement.
+
+  The distributed-run commit was originally `98c7828`; its message was amended
+  to correct the same four prose figures (same pattern as Phase 2's
+  `85b89a7` → `bcfeba3`). Code and data were unchanged and always correct.
 - **Later:** Phase 4 (optimization / efficient frontier), Phase 5 (Workflows +
   MLflow orchestration), Phase 6 (analysis & reporting).
 
@@ -101,13 +199,16 @@ Structured to demonstrate three roles in one system:
   returns curve: within a channel `clicks = spend / CPC`, so revenue is exactly
   LINEAR in spend. Bronze gives `paid_search` an expected ROAS of 3.26x against
   1.97x for the next best (+65%), an edge large enough that concentrating also
-  raises the 5th percentile. Measured across all 21 candidates x 4 scenarios,
-  100% paid_search simultaneously maximises expected revenue, VaR-95 AND
-  CVaR-95 — so the mean-VaR Pareto set is a single point and a corner walk
-  confirms the optimum is at the corner, not interior. Only mean-VARIANCE
-  yields a real tradeoff (13 of 21 non-dominated). Phase 4 must add a spend
-  response curve before an efficient frontier means anything; that was out of
-  scope for Phase 3.
+  raises the 5th percentile. What is actually MEASURED across the 21 candidates
+  x 4 scenarios: `dominant_paid_search` (80/5/5/5/5, the most concentrated
+  candidate in the set) simultaneously maximises expected revenue, VaR-95 AND
+  CVaR-95 in all four scenarios, and the mean-VaR Pareto set is a single point
+  (1 of 21) in all four. A 100% paid_search corner is an EXTRAPOLATION from the
+  model's linearity, not a measurement — no such candidate exists in the grid,
+  where max spend_pct is 0.80. Only mean-VARIANCE yields a real tradeoff
+  (13 of 21 non-dominated under normal / recession / seasonal_peak, 12 of 21
+  under platform_algo_change). Phase 4 must add a spend response curve before
+  an efficient frontier means anything; that was out of scope for Phase 3.
 
 ## How this project is orchestrated
 
