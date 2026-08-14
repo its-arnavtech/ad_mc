@@ -373,7 +373,47 @@ Structured to demonstrate three roles in one system:
   in different places. Ranks are now tie-averaged and the value is a stable
   -0.5082, matching scipy. This never affected pass/fail: the asserted
   variables have no ties.
-- **Later:** Phase 4 (optimization / efficient frontier), Phase 5 (Workflows +
+- **Phase 4 (Optimization sweep / efficient frontier):** IN PROGRESS on branch
+  `phase-4-optimization` (branched off `phase-4-saturation-curve` at
+  `28f0d62`). The saturation prerequisite above is what makes this meaningful
+  at all — without it the answer is a corner and there is nothing to trace.
+  Populates the so-far-empty `gold` schema. NOT Phase 5 (no Workflows, no
+  MLflow).
+
+  **Two decisions the user made, both departures worth knowing about:**
+  1. **COMMON RANDOM NUMBERS, not Phase 3's per-cell independence.** A
+     frontier is decided by PAIRWISE DOMINANCE, and with independent seeds
+     every comparison carries the full SE of a difference (~$2,400) against
+     the ~$18,500 that separates real frontier points — so noise would flip
+     dominance between close allocations. Sharing the draws within a scenario
+     makes comparisons paired and cancels the common noise. This deliberately
+     contradicts Phase 3's seeding note, which warned that identical streams
+     across cells would invalidate cross-allocation comparison; that warning
+     is about treating individual cell estimates as independent, and is the
+     opposite of what pairing does for DIFFERENCES. The variance-reduction
+     factor is being MEASURED on a subset run both ways, not asserted.
+  2. **Two-stage search:** broad structured + Dirichlet coverage of the
+     simplex, then local refinement around the stage-1 Pareto set, so
+     resolution is spent where the frontier actually is.
+
+  **A gap the optimizer forced:** `saturation_multiplier` raised on zero
+  spend, which blocked the search from reaching the simplex boundary even
+  though dropping a channel is a legitimate allocation. The correct limit is
+  revenue ∝ `spend^(1-theta) → 0`, so zero spend must give zero revenue for
+  that channel, not an error and not an infinity. Negative spend still raises.
+
+  **Scale note, and why Spark finally earns its keep here.** Phase 3's 84
+  cells ran in 7.4s single-threaded, so distribution was a demonstration. The
+  sweep is 500-800 candidates x 4 scenarios x 10,000 paths = 20-32 MILLION
+  paths, which is genuinely worth distributing. Output grain is ONE AGGREGATE
+  ROW per (allocation, scenario) — mean/std/VaR/CVaR/ROAS computed inside the
+  UDF — not path level, which would be tens of millions of rows with no
+  consumer.
+
+  **Expect a thin mean-VaR frontier and say so.** `corr(mean, VaR-95)` is
+  0.9397 across allocations, so the mean-VaR Pareto set stays short however
+  finely the simplex is sampled. Mean-VARIANCE is the richer tradeoff.
+- **Later:** Phase 5 (Workflows +
   MLflow orchestration), Phase 6 (analysis & reporting).
 
   **HISTORICAL — this describes the LINEAR model, FIXED by the saturation
