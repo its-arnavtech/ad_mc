@@ -54,6 +54,18 @@ WHAT DID NOT CHANGE:
     per channel. Saturation only alters the (mu, sigma) handed to
     `rng.lognormal`; it adds no draw, removes none, and reorders none.
 
+ZERO SPEND (PHASE 4 OPTIMIZATION)
+=================================
+A channel may now be allocated exactly $0. Its clicks are `0.0 / CPC == 0.0`
+exactly and it contributes no revenue -- which is the true limit of the
+saturation curve, since revenue is proportional to `spend**(1 - theta)`. It is
+NOT an error and NOT an infinity. The idle channel still draws its own CPC and
+RPC block from the stream (using placeholder moments it cannot influence
+anything with), so dropping a channel does not shift any other channel's draws;
+that is what lets Phase 4's optimizer compare allocations with different support
+under common random numbers. NEGATIVE spend raises, in both the saturated and
+the unsaturated model.
+
 A CONSEQUENCE OF THE SPEC WORTH KNOWING (see saturation.py for the numbers):
 only the MEAN cpc is spend-dependent by default. `fit_lognormal_moments`
 derives sigma from std/mean, so a rising mean against bronze's fixed std means
@@ -93,10 +105,10 @@ import numpy as np
 from scipy import stats
 
 try:  # package-style import (simulation.engine / ad_mc_sim.engine)
-    from .saturation import REFERENCE_SPEND, saturation_multiplier
+    from .saturation import REFERENCE_SPEND, effective_cpc_moments
 except ImportError:
     try:  # flat import, which is how the rest of this repo runs
-        from saturation import REFERENCE_SPEND, saturation_multiplier
+        from saturation import REFERENCE_SPEND, effective_cpc_moments
     except ImportError as exc:  # pragma: no cover -- packaging mistake, not a code path
         # This is the failure mode a Spark executor will hit if the wheel is built
         # without saturation.py. Raising here with the fix named is worth the six
@@ -209,9 +221,15 @@ class SimulationResult:
     # rather than silently looking the same.
     theta: np.ndarray | None = None                  # (k,) CPC elasticity w.r.t. spend
     reference_spend: float | None = None
-    saturation_multiplier: np.ndarray | None = None  # (k,) (spend/ref)**theta
+    saturation_multiplier: np.ndarray | None = None  # (k,) (spend/ref)**theta, 0.0 if idle
     effective_mean_cpc: np.ndarray | None = None     # (k,) mean actually fitted
     effective_std_cpc: np.ndarray | None = None      # (k,) std actually fitted
+    # (k,) True where spend == 0. Those channels contribute exactly zero clicks,
+    # conversions and revenue; their `effective_mean_cpc` above is a PLACEHOLDER
+    # (the unsaturated bronze mean) that exists only so the lognormal fit is well
+    # posed and the RNG draw order is unchanged. Never read it for an idle
+    # channel -- read `saturation_multiplier`, which is the true 0.0.
+    idle_channel: np.ndarray | None = None
 
     @property
     def n_paths(self) -> int:
@@ -275,21 +293,35 @@ def simulate(
     rng = np.random.default_rng(seed)
     spend = np.array([allocation[c] for c in channels], dtype=float)
 
+    # Spend must be finite and non-negative in BOTH models. Zero is allowed and
+    # means "this channel is not funded": clicks = 0/CPC = 0 exactly, so the
+    # channel contributes nothing and nothing downstream can go NaN or infinite.
+    # Negative spend has no interpretation and is always a caller bug, so it
+    # raises here rather than silently producing negative revenue.
+    if not np.all(np.isfinite(spend)):
+        raise ValueError(f"allocation must be finite, got {dict(zip(channels, spend))}")
+    if np.any(spend < 0.0):
+        raise ValueError(
+            f"allocation has negative spend: "
+            f"{ {c: s for c, s in zip(channels, spend) if s < 0.0} }. Zero is allowed "
+            f"(the channel simply earns nothing); negative is not."
+        )
+
     # 0. spend saturation -- the ONLY thing that changes here is the mean (and
     #    optionally the std) handed to the CPC moment fit in step 2. No RNG call
     #    happens in this block, so the draw order below is unaffected.
     if theta is None:
         sat_mult = None
+        idle = None
         eff_mean_cpc = mean_cpc          # by identity: not `* 1.0`
         eff_std_cpc = std_cpc
     else:
         theta = np.asarray(theta, dtype=float)
         if theta.shape != (k,):
             raise ValueError(f"theta shape {theta.shape}, expected {(k,)}")
-        sat_mult = saturation_multiplier(spend, theta, reference_spend)
-        eff_mean_cpc = np.asarray(mean_cpc, dtype=float) * sat_mult
-        eff_std_cpc = (np.asarray(std_cpc, dtype=float) * sat_mult
-                       if saturate_std_cpc else std_cpc)
+        eff_mean_cpc, eff_std_cpc, sat_mult, idle = effective_cpc_moments(
+            mean_cpc, std_cpc, spend, theta, reference_spend, saturate_std_cpc
+        )
 
     # 1. correlated CVR through a Gaussian copula
     chol = cholesky_factor(correlation)
@@ -324,6 +356,18 @@ def simulate(
     revenue_by_channel = conversions * rpc
     total_revenue = revenue_by_channel.sum(axis=1)
 
+    # A lognormal draw is exp(finite), so CPC is strictly positive and this can
+    # only fire if something upstream is broken (a zero CPC would give inf for a
+    # funded channel and NaN for an idle one -- the exact failure mode the
+    # zero-spend path has to be safe against). O(n_paths), one pass, cheap.
+    if not np.all(np.isfinite(total_revenue)):
+        n_bad = int((~np.isfinite(total_revenue)).sum())
+        raise ValueError(
+            f"{n_bad} of {n_paths} paths produced non-finite revenue; CPC min was "
+            f"{float(cpc.min()):.6g} (must be > 0). Allocation: "
+            f"{dict(zip(channels, spend))}"
+        )
+
     return SimulationResult(
         channels=list(channels),
         allocation=spend,
@@ -340,6 +384,7 @@ def simulate(
         saturation_multiplier=sat_mult,
         effective_mean_cpc=None if theta is None else np.asarray(eff_mean_cpc, dtype=float),
         effective_std_cpc=None if theta is None else np.asarray(eff_std_cpc, dtype=float),
+        idle_channel=idle,
     )
 
 

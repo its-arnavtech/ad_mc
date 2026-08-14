@@ -383,15 +383,29 @@ Structured to demonstrate three roles in one system:
   **Two decisions the user made, both departures worth knowing about:**
   1. **COMMON RANDOM NUMBERS, not Phase 3's per-cell independence.** A
      frontier is decided by PAIRWISE DOMINANCE, and with independent seeds
-     every comparison carries the full SE of a difference (~$2,400) against
-     the ~$18,500 that separates real frontier points — so noise would flip
-     dominance between close allocations. Sharing the draws within a scenario
+     every comparison carries the full SE of a difference (~$2,600-$3,000)
+     against gaps that turned out to be much smaller than the ~$18,500
+     assumed at design time: realized adjacent gaps along the `normal`
+     mean-VaR frontier are $9,961 / $2,714 / $6,777 / $5,971 / **$323**. So
+     noise would flip dominance between close allocations. Sharing the draws within a scenario
      makes comparisons paired and cancels the common noise. This deliberately
      contradicts Phase 3's seeding note, which warned that identical streams
      across cells would invalidate cross-allocation comparison; that warning
      is about treating individual cell estimates as independent, and is the
-     opposite of what pairing does for DIFFERENCES. The variance-reduction
-     factor is being MEASURED on a subset run both ways, not asserted.
+     opposite of what pairing does for DIFFERENCES. MEASURED at 300
+     replicates per arm — and the gain is NOT one number, because CRN cancels
+     COMMON noise and therefore grows as two allocations get more similar,
+     which is exactly the regime a frontier lives in:
+     distant pair $647 vs $2,638 (**16.6x**, CI [13.2, 20.9]); near-frontier
+     $561 vs $2,756 (**24.1x**); nearly identical $45 vs $2,974 (**4,370x**).
+     The independent arm sits at $2,600-$3,000 regardless of the pair — it
+     gets no benefit from similarity. No detectable bias (max |t| = 0.68).
+     An earlier 60-replicate reading of $2,397 / 9.2x / $121 was a single
+     noisy realization and understated the gain; do not requote it. Verified mechanically
+     too: at a shared seed two DIFFERENT allocations draw bitwise-identical
+     CVR and RPC matrices, and a zero-spend allocation still draws the same
+     stream (the idle channel keeps consuming its own lognormal block, so
+     dropping a channel does not shift the draws of the ones after it).
   2. **Two-stage search:** broad structured + Dirichlet coverage of the
      simplex, then local refinement around the stage-1 Pareto set, so
      resolution is spent where the frontier actually is.
@@ -410,9 +424,114 @@ Structured to demonstrate three roles in one system:
   UDF — not path level, which would be tens of millions of rows with no
   consumer.
 
-  **Expect a thin mean-VaR frontier and say so.** `corr(mean, VaR-95)` is
-  0.9397 across allocations, so the mean-VaR Pareto set stays short however
-  finely the simplex is sampled. Mean-VARIANCE is the richer tradeoff.
+  **RUN COMPLETE. 971 candidates x 4 scenarios x 10,000 paths = 38,840,000
+  paths**, 292s single-threaded locally (571 stage-1 + 400 stage-2). Gold is
+  populated and independently re-queried: `allocation_sweep_results` 3,884
+  rows, `efficient_frontier` 512, `frontier_recommendations` 36. Checks pass:
+  no null metrics, CVaR-95 <= VaR-95 everywhere, every candidate spends the
+  full budget, no orphan frontier rows.
+
+  **THE THIN-FRONTIER PREDICTION WAS RIGHT, AND SAMPLING HARDER MADE IT
+  WORSE, NOT BETTER.** Non-dominated counts of 971:
+
+      mean vs VaR-95   6 / 5 / 4 / 5   (normal / platform / recession / seasonal)
+      mean vs CVaR-95  6 / 5 / 6 / 7
+      mean vs std    111 / 112 / 119 / 126
+
+  **Only mean-VARIANCE is a curve worth the name** (~11-13%). Report the
+  mean-VaR result as a short arc; do not dress it up.
+
+  **DO NOT ARGUE THIS FROM THE PROPORTION — that inference is invalid, and the
+  Phase 4 verifier disproved it.** An earlier draft said the mean-VaR set being
+  0.62% of 971 versus 9.5% of 21 "settles" that the collinearity is structural.
+  It settles nothing: the expected size of a 2-objective Pareto front grows
+  like `ln(n) + gamma`, so the PROPORTION falls mechanically with n whatever
+  the structure (the null predicts 17.4% at n=21 and 0.77% at n=971, so the
+  observed drop is LESS dramatic than chance). Subsampling 21 of the 971
+  candidates 2,000 times gives a median front size of **2**, with
+  P(size = 2) = 48.1% — Phase 3's "2 of 21" is the MODAL outcome of drawing 21
+  from Phase 4's own set, so the two results never disagreed.
+  Permuting `var_95` to destroy the correlation raises the front only from
+  6 to ~7.2 (against `H_971` = 7.46), so **near-collinearity explains only
+  about 17% of the thinness**; the rest is the generic log(n) behaviour of any
+  two-objective front. The defensible statement rests on the COUNT: 2 -> 6 as
+  n went 21 -> 971 is what theory predicts, and mean-std at 111 is the one
+  that sits far ABOVE the null, which is why only it is a real curve.
+
+  **Stage 2 earned its place, measurably.** Mean-variance non-dominated went
+  44 (stage 1 alone) -> 111 (both stages), and two of the three mean-VaR
+  recommendations are stage-2 points -- one perturbation, one blend, and 94
+  of the 111 mean-variance non-dominated points are stage-2. Stage 2's
+  contribution is frontier DENSITY, not the revenue record: the best expected
+  revenue found, $1,054,860 (`dir1_110`), is a **stage-1** Dirichlet candidate
+  and owes nothing to refinement. It still beats the Phase 3 grid's best of
+  $1,035,656 (`heavy_paid_search`) by 1.85%, so broad sampling alone reached
+  allocations the fixed 21-candidate set could not.
+
+  **A stage-2 capping defect was found and fixed.** `out[:max_candidates]`
+  truncated a list with all perturbations appended before all blends, so at
+  >= 25 stage-1 frontier points it kept 400 perturbations and **zero blends**
+  -- deleting precisely the move that densifies a thin frontier, which is the
+  one thing this model needs. (At 20 points it cut blends 180 -> 80.) The cap
+  is now per-family round-robin. Blends survive and land ON the frontier.
+
+  **A FRONTIER CAN BE NON-DEGENERATE AND STILL NOT ORDERED.** `n_efficient`
+  only asks whether the frontier has an interior; it does not ask whether the
+  points are far enough apart for their ORDER to be real. Realized adjacent
+  gaps on the `normal` mean-VaR frontier are
+  $9,961 / $2,714 / $6,777 / $5,971 / **$323**, and that last pair was measured
+  directly: its own CRN difference SD is **$322**, so the gap is 1.0x the noise
+  and ranks 5 and 6 are NOT ordered by this sweep. `recommend_from_frontier`
+  now emits `nearest_neighbour_gap` and `ordering_unresolved` (gap < 2x the
+  measured CRN noise, default $650 — the conservative end, since over-flagging
+  is the safe direction). **6 of 36 picks are flagged**, including exactly the
+  mean-VaR `min_risk` pick. The flag does not change which point is chosen; it
+  stops the rule implying a precision the data does not have.
+
+  **`verifier` (2026-08-14) against live Databricks — PASS on code and data,
+  PARTIAL on the original prose.** Clean: zero-spend and its CRN coupling, the
+  anchor regression (bitwise 0.000e+00 vs `28f0d62` under both theta modes),
+  gold contents, the stage-2 fix, determinism, git hygiene, no secrets in any
+  commit. It went well past the brief: it **recomputed the entire Pareto
+  frontier with its own brute-force code** and matched all 12
+  (scenario, objective-pair) sets by MEMBERSHIP, not just count; re-simulated
+  9 gold cells at their CRN seeds to max rel 2.1e-16 with seven negative
+  controls; and confirmed no Phase 4 write touched silver — `v16 EXCEPT v17`
+  is exactly 800,000 rows, i.e. precisely the 40,000 `even_split` rows
+  unchanged, which independently re-proves the anchor property. It also found
+  the stage-2 defect was WORSE than reported: the real run had **53** stage-1
+  Pareto points, not 25, so the old code would have kept 400 perturbations and
+  zero blends.
+
+  It caught six prose errors, all corrected above — CODE AND DATA WERE ALWAYS
+  CORRECT: (1) an **invalid inference** arguing thinness from the falling
+  PROPORTION, disproved by subsampling; (2) the CRN trio $2,397 / 9.2x / $121
+  was one noisy 60-replicate realization and UNDERSTATED the gain (the cause is
+  real: `independent_seed` hashes the allocation-id string, so that arm's SD
+  depends on naming); (3) the subsidy headline is composition-driven — 111 of
+  112 frontier points are the mean-variance frontier, and the two risk-floor
+  frontiers lean on the extrapolation LESS than average; (4) $56, not "$60";
+  (5) `dir1_110` is a stage-1 candidate, so the revenue record does not belong
+  under "stage 2 earned its place"; (6) the design-time "$18,500 between
+  frontier points" is contradicted by realized gaps of $323-$9,961.
+  Fourth phase running where the code was right and the self-reported figures
+  were wrong — re-derive before quoting.
+
+  **THE SUBSIDY EXPOSURE GOT WORSE, AS PREDICTED.** The saturation curve
+  discounts CPC below `reference_spend`, a region bronze cannot identify, and
+  a simplex search deliberately visits it. Measured on `normal`: mean subsidy
+  share is **4.58% across all 971 candidates and 5.61% on the 112 frontier
+  points** (max 11.19%), and the thinnest funded channel on a frontier point
+  is **0.000560x reference = $56**, extrapolating the power law ~3 orders of
+  magnitude below anything observed.
+  **BUT SPLIT THAT BY OBJECTIVE PAIR BEFORE REPEATING IT.** 111 of those 112
+  points ARE the mean-variance frontier, so the headline is really a statement
+  about that one frontier (5.64%). Broken out, the mean-VaR frontier averages
+  **1.90%** and mean-CVaR **2.05%** — both BELOW the 4.58% all-candidate
+  average. So "the frontier leans on the extrapolation more than average" is
+  true of the VARIANCE frontier and **false of both risk-floor frontiers**,
+  which lean on it less. Phase 6 should not present frontier allocations without this
+  caveat, and a spend floor is the obvious mitigation.
 - **Later:** Phase 5 (Workflows +
   MLflow orchestration), Phase 6 (analysis & reporting).
 

@@ -144,6 +144,43 @@ rests entirely on an unmeasured extrapolation below the anchor. Anyone reading a
 frontier off this model should know that both the penalty and the subsidy are
 assumed, not measured.
 
+ZERO SPEND IS A LEGITIMATE ALLOCATION (PHASE 4 OPTIMIZATION)
+============================================================
+Through the saturation-curve prerequisite `saturation_multiplier` RAISED on zero
+spend. That was defensible while the only caller was Phase 3's fixed 21-candidate
+grid, whose floor is 5% = $25,000 -- but it blocks an optimizer from reaching the
+boundary of the simplex, and dropping a channel entirely is a perfectly ordinary
+allocation to want to evaluate.
+
+The limit is not ambiguous. A channel's revenue is
+
+    revenue_i  ~  spend_i / effective_cpc_i
+               =  spend_i ** (1 - theta_i) * ref ** theta_i / mean_cpc_i
+
+which for any theta_i < 1 -- and theta >= 1 is already rejected -- tends to
+EXACTLY 0 as spend -> 0. So zero spend must mean zero clicks and zero revenue for
+that channel: not an error, and emphatically not an infinity.
+
+`saturation_multiplier` therefore now returns the mathematically exact
+`(0/ref)**theta == 0.0` at zero spend. NEGATIVE spend still raises -- there is no
+sensible limit for it and it is always a caller bug.
+
+A multiplier of exactly 0.0 makes the EFFECTIVE MEAN CPC zero, and
+`fit_lognormal_moments` has no parameters for a zero mean, so the engine cannot
+fit that channel's CPC marginal. `effective_cpc_moments` below handles that: it
+reports the true multiplier (0.0) and a mask of the idle channels, but hands back
+the UNSATURATED bronze moments for the fit itself. That substitution is invisible
+in the output -- `clicks = spend / CPC` is `0.0 / positive == 0.0` exactly, for
+any finite positive CPC -- and it is what keeps the RNG draw order intact: the
+idle channel still consumes exactly its own lognormal block, so a channel going
+to zero does NOT shift the draws of the channels after it. That property is
+load-bearing for Phase 4's common-random-numbers sweep, where every allocation in
+a scenario must see the same underlying stream regardless of which channels it
+happens to fund.
+
+Read `result.saturation_multiplier == 0.0` (or `spend == 0`) to identify an idle
+channel; do NOT read `result.effective_mean_cpc`, which carries the placeholder.
+
 A DELIBERATE CONSEQUENCE OF THE SPEC: THE CPC DISTRIBUTION TIGHTENS
 ===================================================================
 The spec fixes that ONLY the mean CPC responds to spend; `std_cpc` keeps its
@@ -316,23 +353,28 @@ def saturation_multiplier(
 ) -> np.ndarray:
     """(spend / reference_spend) ** theta, elementwise, with the edge cases nailed down.
 
-    Two properties this function must have, both load-bearing:
+    Three properties this function must have, all load-bearing:
 
       * EXACTLY 1.0 at spend == reference_spend. `1.0 ** theta` is exactly 1.0
         in IEEE-754 for any finite theta, and `x * 1.0 == x` bitwise, so the
         even-split anchor reproduces Phase 2/3 to the bit rather than to a
         tolerance.
-      * NO SILENT INFINITIES AT ZERO SPEND. For theta > 0, (0/ref)**theta == 0,
-        which would make the effective CPC zero and clicks infinite. A channel
-        with no budget should contribute no revenue, not undefined revenue, so
-        zero or negative spend raises here instead of poisoning the arithmetic
-        downstream. (None of the 21 Phase 3 candidates has a zero channel -- the
-        floor is 5% = $25,000 -- so this is a guard, not a workaround.)
+      * EXACTLY 0.0 at zero spend (for theta > 0), which is the true limit of
+        `(spend/ref)**theta` and the reason a channel with no budget earns no
+        revenue. See "ZERO SPEND IS A LEGITIMATE ALLOCATION" in the module
+        docstring: this REPLACES the earlier behaviour of raising, which blocked
+        the Phase 4 optimizer from reaching the boundary of the simplex.
+        A zero multiplier means a zero effective mean CPC, which is not a
+        fittable lognormal -- `effective_cpc_moments` is the supported way to
+        consume this and deals with that; a caller using the raw multiplier to
+        build CPC parameters must handle it.
+      * NEGATIVE SPEND STILL RAISES, for every channel, whatever its theta.
+        `(-x/ref)**theta` is not real for fractional theta, and there is no limit
+        argument that rescues it -- negative spend is always a caller bug.
 
-    Channels with theta == 0 are short-circuited to a multiplier of exactly 1.0
-    and are exempt from the positive-spend requirement, since 0**0 is a
-    convention argument the caller should not have to care about and an
-    unsaturated channel at zero spend is perfectly well defined.
+    Channels with theta == 0 are short-circuited to a multiplier of exactly 1.0,
+    since 0**0 is a convention argument the caller should not have to care about
+    and an unsaturated channel is scale-free by definition.
     """
     spend = np.asarray(spend, dtype=float)
     theta = np.asarray(theta, dtype=float)
@@ -342,22 +384,59 @@ def saturation_multiplier(
         raise ValueError(f"reference_spend must be finite and > 0, got {reference_spend}")
     if not np.all(np.isfinite(spend)):
         raise ValueError(f"spend must be finite, got {spend}")
+    negative = spend < 0.0
+    if np.any(negative):
+        raise ValueError(
+            f"channels at index {np.flatnonzero(negative).tolist()} have NEGATIVE spend "
+            f"{spend[negative].tolist()}; a budget cannot be negative and "
+            f"(spend/ref)**theta is not real for fractional theta. Zero spend is allowed "
+            f"and yields a multiplier of exactly 0.0 (no clicks, no revenue)."
+        )
     validate_theta_mapping({f"index {i}": t for i, t in enumerate(theta)})
 
     mult = np.ones_like(spend)
     active = theta != 0.0
     if np.any(active):
-        bad = active & (spend <= 0.0)
-        if np.any(bad):
-            raise ValueError(
-                f"channels at index {np.flatnonzero(bad).tolist()} have spend "
-                f"{spend[bad].tolist()} with theta {theta[bad].tolist()}; saturation is "
-                f"undefined at non-positive spend ((0/ref)**theta == 0 would give an "
-                f"effective CPC of zero and infinite clicks). Either drop the channel "
-                f"from the allocation or set its theta to 0."
-            )
         mult[active] = (spend[active] / reference_spend) ** theta[active]
     return mult
+
+
+def effective_cpc_moments(
+    mean_cpc: np.ndarray,
+    std_cpc: np.ndarray,
+    spend: np.ndarray,
+    theta: np.ndarray,
+    reference_spend: float = REFERENCE_SPEND,
+    saturate_std_cpc: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """CPC moments to FIT, the true multiplier, and which channels are idle.
+
+    Returns `(fit_mean_cpc, fit_std_cpc, multiplier, idle_mask)`.
+
+    `multiplier` is the exact `(spend/ref)**theta`, so it is 0.0 for a channel at
+    zero spend. `fit_mean_cpc` / `fit_std_cpc` are what a lognormal moment fit can
+    actually accept: identical to `mean_cpc * multiplier` everywhere EXCEPT the
+    idle channels, where the unsaturated bronze moments are substituted so the fit
+    is well posed. The substitution cannot change any result -- an idle channel's
+    clicks are `0.0 / CPC == 0.0` exactly for any finite positive CPC -- and it
+    keeps the RNG consumption of an idle channel identical to a funded one, which
+    is what makes common random numbers hold across allocations with different
+    support. See the module docstring.
+
+    BITWISE: with no idle channels this is exactly the arithmetic the
+    saturation-curve engine already did, including `x * 1.0 == x` at the
+    reference point and passing `std_cpc` through untouched when
+    `saturate_std_cpc` is False.
+    """
+    mult = saturation_multiplier(spend, theta, reference_spend)
+    fit_mean = np.asarray(mean_cpc, dtype=float) * mult
+    fit_std = (np.asarray(std_cpc, dtype=float) * mult
+               if saturate_std_cpc else np.asarray(std_cpc, dtype=float))
+    idle = np.asarray(spend, dtype=float) == 0.0
+    if np.any(idle):
+        fit_mean = np.where(idle, np.asarray(mean_cpc, dtype=float), fit_mean)
+        fit_std = np.where(idle, np.asarray(std_cpc, dtype=float), fit_std)
+    return fit_mean, fit_std, mult, idle
 
 
 def effective_mean_cpc(
