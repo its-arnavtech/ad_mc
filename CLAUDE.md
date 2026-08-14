@@ -191,11 +191,28 @@ Structured to demonstrate three roles in one system:
   The distributed-run commit was originally `98c7828`; its message was amended
   to correct the same four prose figures (same pattern as Phase 2's
   `85b89a7` → `bcfeba3`). Code and data were unchanged and always correct.
+- **Phase 4 prerequisite (spend-saturation curve):** IN PROGRESS on branch
+  `phase-4-saturation-curve` (branched off `phase-3-distributed-simulation`
+  at `bfc3b46`). Fixes the degenerate frontier described below BEFORE any
+  optimization work starts. Diminishing returns enter at the CPC step rather
+  than as a generic curve on revenue, because the mechanism is real: buying
+  more volume in a channel exhausts the cheapest inventory first and drags
+  your average cost-per-click up.
+
+      effective_mean_cpc(spend) = mean_cpc_bronze * (spend/reference_spend) ** theta_channel
+
+  with `reference_spend = $100,000` — the even-split-per-channel point Phase 2
+  and Phase 3's anchor cell already validated. At that point the multiplier is
+  `1.0**theta`, exactly 1.0 in IEEE754, so the curve is self-anchoring and the
+  validated numbers must still reproduce BITWISE. That is the regression test,
+  not a nicety. Everything downstream (lognormal CPC noise, correlated CVR
+  copula, RPC draw) is untouched; only the mean fed to the CPC fit changes.
+  NOT the optimization sweep — no new candidates, no frontier search yet.
 - **Later:** Phase 4 (optimization / efficient frontier), Phase 5 (Workflows +
   MLflow orchestration), Phase 6 (analysis & reporting).
 
-  **WARNING FOR PHASE 4 — the frontier is currently degenerate, and it is a
-  modeling artifact, not a bug.** The engine has no saturation / diminishing-
+  **WARNING FOR PHASE 4 — the frontier is degenerate WITHOUT the saturation
+  curve above, and it is a modeling artifact, not a bug.** The engine has no saturation / diminishing-
   returns curve: within a channel `clicks = spend / CPC`, so revenue is exactly
   LINEAR in spend. Bronze gives `paid_search` an expected ROAS of 3.26x against
   1.97x for the next best (+65%), an edge large enough that concentrating also
