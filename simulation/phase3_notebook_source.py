@@ -1,6 +1,6 @@
 # Databricks notebook source
 # =============================================================================
-# PHASE 3 -- DISTRIBUTED BATCH SIMULATION
+# DISTRIBUTED BATCH SIMULATION -- 21 ALLOCATIONS x 4 SCENARIOS x 10,000 PATHS
 #
 # This file is a Databricks SOURCE-format notebook. It is not run locally and
 # not imported by anything; `simulation/run_phase3_distributed.py` uploads it to
@@ -8,29 +8,47 @@
 # compute. Read that module first -- it explains why this shape was forced.
 #
 # WHAT RUNS HERE
-#   1. prove `ad_mc_sim` (the packaged Phase 2 simulation modules) imports on the
+#   1. prove `ad_mc_sim` (the packaged simulation modules) imports on the
 #      EXECUTORS, not just the driver -- see the probe below
 #   2. read bronze/silver reference tables through Spark
-#   3. build the 21 x 4 = 84 cell grid in the DRIVER, with each cell's seed
+#   3. resolve the saturation curve: theta per channel, and the checks that make
+#      it falsifiable rather than asserted
+#   4. build the 21 x 4 = 84 cell grid in the DRIVER, with each cell's seed
 #      computed here so seeds are visible in the job's own lineage
-#   4. groupBy(allocation_id, scenario_id).applyInPandas(...) -- one 10,000-path
-#      Monte Carlo batch per group, through the FROZEN Phase 2 engine
-#   5. INSERT OVERWRITE ad_mc_poc.silver.simulated_allocation_outcomes
-#   6. a side test: the anchor cell at Phase 2's pinned seed, for exact comparison
-#   7. a diagnostics pass that measures how the work actually spread
+#   5. groupBy(allocation_id, scenario_id).applyInPandas(...) -- one 10,000-path
+#      Monte Carlo batch per group
+#   6. INSERT OVERWRITE ad_mc_poc.silver.simulated_allocation_outcomes
+#   7. a side test: the anchor cell at Phase 2's pinned seed, for exact comparison
+#   8. a diagnostics pass that measures how the work actually spread
+#
+# PHASE 4: SATURATION
+#   Built for Phase 3, when the engine was frozen at its Phase 2 bytes and
+#   revenue was exactly LINEAR in spend. Phase 4 added an opt-in spend-saturation
+#   curve; when the `saturation` widget is "on" this notebook resolves a theta
+#   vector and threads it, plus `reference_spend` and `saturate_std_cpc`, into
+#   `simulate_cell`. NOTHING ELSE ABOUT THE RUN CHANGES: same 21 candidates, same
+#   4 scenarios, same derived seeds off the same master seed, same write.
+#
+#   theta comes from `ad_mc_sim.saturation.DEFAULT_THETA` -- the WHEEL's copy,
+#   i.e. the code that will actually execute -- and is cross-checked against the
+#   value the runner passed in the `theta_json` widget. If a stale wheel were
+#   installed those two would disagree and the run stops.
 #
 # MODULE DISTRIBUTION
 #   `ad_mc_sim` is a wheel built from simulation/{engine,cell,scenarios,
-#   allocations,seeding,config}.py and installed through the serverless
-#   ENVIRONMENT SPEC (`dependencies=[<wheel on a UC volume>]`), not through
-#   `%pip` in a cell and not through sys.path hacking. The environment spec is
-#   resolved before the notebook starts and applies to the whole compute,
+#   allocations,seeding,saturation,config}.py and installed through the
+#   serverless ENVIRONMENT SPEC (`dependencies=[<wheel on a UC volume>]`), not
+#   through `%pip` in a cell and not through sys.path hacking. The environment
+#   spec is resolved before the notebook starts and applies to the whole compute,
 #   including the Python UDF workers -- which is the failure mode the probe in
 #   step 1 exists to rule out.
 #
+#   `saturation.py` is load-bearing here: `engine.py` imports it at module scope,
+#   so a wheel missing it yields an engine that raises on import inside a UDF
+#   task. The probe imports it explicitly for that reason.
+#
 # NOTHING HERE REIMPLEMENTS THE MATH. `ad_mc_sim.cell.simulate_cell` wraps
-# `ad_mc_sim.engine.simulate`, both byte-identical to the validated Phase 2
-# modules.
+# `ad_mc_sim.engine.simulate`; both are the repo's own modules, shipped verbatim.
 # =============================================================================
 
 # COMMAND ----------
@@ -60,6 +78,10 @@ dbutils.widgets.text("anchor_out_path",
                      "/Volumes/ad_mc_poc/bronze/landing/phase3/anchor_revenue_cluster.npy",
                      "Where to write the anchor revenue vector")
 dbutils.widgets.text("catalog", "ad_mc_poc", "Catalog")
+dbutils.widgets.text("saturation", "on", "Spend saturation: on | off")
+dbutils.widgets.text("theta_json", "", "Driver's DEFAULT_THETA, for cross-check")
+dbutils.widgets.text("reference_spend", "100000.0", "Spend where eff. CPC == bronze CPC")
+dbutils.widgets.text("saturate_std_cpc", "false", "Scale std_cpc too (CV-preserving)")
 
 N_PATHS = int(dbutils.widgets.get("n_paths"))
 SHUFFLE_PARTITIONS = int(dbutils.widgets.get("shuffle_partitions"))
@@ -67,7 +89,12 @@ WRITE_MODE = dbutils.widgets.get("write_mode").strip().lower()
 ANCHOR_SEED = int(dbutils.widgets.get("anchor_seed"))
 ANCHOR_OUT_PATH = dbutils.widgets.get("anchor_out_path")
 CATALOG = dbutils.widgets.get("catalog")
+SATURATION_ON = dbutils.widgets.get("saturation").strip().lower() == "on"
+DRIVER_THETA_JSON = dbutils.widgets.get("theta_json").strip()
+REFERENCE_SPEND = float(dbutils.widgets.get("reference_spend"))
+SATURATE_STD_CPC = dbutils.widgets.get("saturate_std_cpc").strip().lower() == "true"
 
+TBL_HISTORY = f"{CATALOG}.bronze.channel_performance_history"
 TBL_ASSUMPTIONS = f"{CATALOG}.bronze.channel_assumptions"
 TBL_CVR_CORR = f"{CATALOG}.bronze.channel_cvr_correlation_matrix"
 TBL_SCENARIOS = f"{CATALOG}.bronze.scenario_definitions"
@@ -141,7 +168,8 @@ RESULT["spark_version"] = spark.version
 
 PROBE_SCHEMA = (
     "grp int, host string, pid int, worker_uid string, module_file string, "
-    "py string, numpy string, scipy string, beta_a double, beta_b double"
+    "py string, numpy string, scipy string, beta_a double, beta_b double, "
+    "saturation_import_ok boolean"
 )
 
 
@@ -182,7 +210,20 @@ def _probe(pdf: pd.DataFrame) -> pd.DataFrame:
     from ad_mc_sim import cell as _cell   # noqa: F401  -- imported to prove it resolves
     from ad_mc_sim import engine as _engine
 
-    # a real call into the frozen engine, not just an import
+    # `engine` imports `saturation` at module scope, so a wheel missing that
+    # module yields an engine that raises on import inside a UDF task. Prove
+    # explicitly that it resolved ON THE EXECUTOR, and that the curve evaluates
+    # there -- an import alone would not catch a truncated module.
+    try:
+        from ad_mc_sim import saturation as _saturation
+
+        _mult = float(_saturation.saturation_multiplier(
+            _np.array([100_000.0]), _np.array([0.3]), 100_000.0)[0])
+        _saturation_import_ok = bool(_saturation.DEFAULT_THETA) and _mult == 1.0
+    except Exception:  # noqa: BLE001 -- reported as False, never swallowed silently
+        _saturation_import_ok = False
+
+    # a real call into the engine, not just an import
     a, b = _engine.fit_beta_moments(0.05, 0.01)
     return pd.DataFrame({
         "grp": [int(pdf["grp"].iloc[0])],
@@ -195,6 +236,7 @@ def _probe(pdf: pd.DataFrame) -> pd.DataFrame:
         "scipy": [_scipy.__version__],
         "beta_a": [float(a)],
         "beta_b": [float(b)],
+        "saturation_import_ok": [bool(_saturation_import_ok)],
     })
 
 
@@ -223,6 +265,8 @@ try:
         "executor_numpy": probe_out["numpy"].iloc[0],
         "executor_scipy": probe_out["scipy"].iloc[0],
         "engine_call_ok": bool(np.allclose(probe_out["beta_a"], 0.05 * (0.05 * 0.95 / 1e-4 - 1))),
+        # False if ANY executor failed to import/evaluate saturation.py.
+        "saturation_import_ok": bool(probe_out["saturation_import_ok"].all()),
         "pid_differs_from_driver": bool(
             all(int(p) != os.getpid() for p in probe_out["pid"].unique())
         ),
@@ -364,6 +408,12 @@ try:
         "total_paths": int(n_cells) * N_PATHS,
         "anchor_derived_seed": str(seed_map[("even_split", "normal")]),
         "distinct_seeds": len({v for v in seed_map.values()}),
+        # Emitted so the runner can VERIFY these rather than assume them: the
+        # grid must be uniformly derived off the unchanged master seed, with no
+        # privileged anchor cell. A pinned anchor would make the (even_split,
+        # normal) row replay Phase 2's draw instead of being an independent one.
+        "master_seed": int(seeding.MASTER_SEED),
+        "pin_phase2_anchor": False,
     }
 except Exception as exc:  # noqa: BLE001
     finish("failed", stage="build_grid", error=repr(exc),
@@ -387,9 +437,87 @@ _moments = moments
 _corr_list = corr_list
 _alloc_dollars = alloc_dollars
 
+# --- resolve theta, and make a stale wheel impossible to miss ----------------
+# theta is read from the WHEEL's copy of saturation.py -- the code that will
+# actually execute inside the UDF -- and then cross-checked against the value
+# the runner computed from the working tree and passed in `theta_json`. If the
+# environment resolved an older wheel, these disagree and the run stops here
+# rather than silently producing linear-model numbers labelled as saturated.
+if SATURATION_ON:
+    from ad_mc_sim import saturation as _sat
+
+    _theta_map = dict(_sat.DEFAULT_THETA)
+    if DRIVER_THETA_JSON:
+        _driver_theta = json.loads(DRIVER_THETA_JSON)
+        _mismatch = {
+            c: (_driver_theta.get(c), _theta_map.get(c))
+            for c in set(_driver_theta) | set(_theta_map)
+            if _driver_theta.get(c) != _theta_map.get(c)
+        }
+        if _mismatch:
+            raise RuntimeError(
+                "STALE WHEEL: theta in the installed ad_mc_sim disagrees with the "
+                f"runner's working-tree value. driver vs wheel: {_mismatch}. "
+                "Rebuild and re-upload the wheel."
+            )
+    _sat.validate_theta_mapping(_theta_map)
+    _theta_arg = _sat.theta_vector(_channels, _theta_map)
+
+    # The frozen impressions snapshot that DEFAULT_THETA was derived from must
+    # still match LIVE bronze, or theta is describing a world that moved. Read
+    # the live footprint here rather than trusting the constant in the wheel.
+    try:
+        _live_impr = {
+            r["channel_id"]: float(r["avg_impr"])
+            for r in spark.sql(
+                f"SELECT channel_id, AVG(impressions) AS avg_impr "
+                f"FROM {CATALOG}.bronze.channel_performance_history "
+                f"GROUP BY channel_id"
+            ).collect()
+        }
+        _snap_diff = _sat.check_impressions_snapshot(_live_impr)
+        _snap_ok = True
+    except Exception as _exc:  # noqa: BLE001 -- reported, never swallowed
+        _snap_ok, _snap_diff = False, repr(_exc)
+
+    # even_split sits exactly on the anchor, so its multiplier must be exactly
+    # 1.0 in every channel. This is the cluster-side restatement of the whole
+    # regression guarantee, computed where the run actually happens.
+    _even_spend = np.array([_alloc_dollars["even_split"][c] for c in _channels], dtype=float)
+    _even_mult = [
+        float(m) for m in _sat.saturation_multiplier(_even_spend, _theta_arg, REFERENCE_SPEND)
+    ]
+
+    RESULT["saturation"] = {
+        "enabled": True,
+        "theta_used": _theta_map,
+        "theta_vector": [float(t) for t in _theta_arg],
+        "theta_matches_driver": (not DRIVER_THETA_JSON) or (_theta_map == json.loads(DRIVER_THETA_JSON)),
+        "reference_spend": REFERENCE_SPEND,
+        "saturate_std_cpc": SATURATE_STD_CPC,
+        "impressions_snapshot_ok": _snap_ok,
+        "impressions_rel_diff": _snap_diff,
+        "even_split_multiplier": _even_mult,
+    }
+    print(f"saturation ON  reference_spend=${REFERENCE_SPEND:,.0f}  "
+          f"saturate_std_cpc={SATURATE_STD_CPC}")
+    for _c, _t in zip(_channels, _theta_arg):
+        print(f"    theta[{_c}] = {_t}")
+    print(f"    even_split multiplier: {_even_mult}  (must be all exactly 1.0)")
+else:
+    _theta_map = {}
+    _theta_arg = None
+    RESULT["saturation"] = {"enabled": False}
+    print("saturation OFF -- linear model, identical to the Phase 3 run")
+
 
 def simulate_group(pdf: pd.DataFrame) -> pd.DataFrame:
-    """applyInPandas body: run one cell through the frozen Phase 2 engine."""
+    """applyInPandas body: run one cell through the engine.
+
+    `_theta_arg` is resolved on the driver and closed over. It is None when the
+    saturation widget is off, which makes this call byte-for-byte the Phase 3
+    call and the engine byte-for-byte the Phase 2 engine.
+    """
     from ad_mc_sim import cell as cell_mod
 
     if pdf.empty:
@@ -418,6 +546,9 @@ def simulate_group(pdf: pd.DataFrame) -> pd.DataFrame:
         revenue_multiplier=float(row["revenue_multiplier"]),
         n_paths=int(row["n_paths"]),
         seed=int(row["seed"]),          # decimal string -> unsigned 64-bit int
+        theta=_theta_arg,
+        reference_spend=REFERENCE_SPEND,
+        saturate_std_cpc=SATURATE_STD_CPC,
     )
 
 

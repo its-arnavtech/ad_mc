@@ -14,8 +14,53 @@ Model, per path, per channel:
 with marginals:
 
     CVR    ~ Beta(a, b)        method-of-moments from mean_cvr / std_cvr
-    CPC    ~ LogNormal(mu, s)  method-of-moments from mean_cpc / std_cpc
+    CPC    ~ LogNormal(mu, s)  method-of-moments from effective mean_cpc / std_cpc
     RPC    ~ LogNormal(mu, s)  method-of-moments from mean/std_revenue_per_conversion
+
+
+PHASE 4 CHANGE -- SPEND SATURATION. THIS FILE WAS FROZEN AFTER PHASE 2
+======================================================================
+This module was deliberately unchanged from Phase 2 (`43c9163`) through the
+whole of Phase 3 -- the distributed layer wrapped it rather than editing it, so
+"distributing the engine did not change the math" could be proven bitwise. This
+is the first edit since, and it is a modelling change, not a refactor.
+
+WHAT CHANGED: `simulate()` gained an optional `theta` (plus `reference_spend`
+and `saturate_std_cpc`). When `theta` is supplied, the MEAN CPC fed into the
+lognormal moment fit becomes spend-dependent:
+
+    effective_mean_cpc_i = mean_cpc_i * (spend_i / reference_spend) ** theta_i
+
+so revenue stops being linear in spend and becomes a power law with exponent
+(1 - theta_i). See `saturation.py` for the economics, the derivation of theta
+from bronze impression volumes, and the assumptions involved.
+
+WHY: without a response curve, expected revenue is linear in the allocation
+weights, so its maximum is always a simplex corner and concentration costs only
+variance, never mean. Phase 3 measured the consequence over 21 candidates x 4
+scenarios: `dominant_paid_search` maximised expected revenue, VaR-95 AND
+CVaR-95 in all four scenarios and the mean-VaR Pareto set was a single point.
+An "efficient frontier" over that model is not a frontier.
+
+WHAT DID NOT CHANGE:
+  * With `theta=None` (the default) this function is behaviourally identical to
+    Phase 2/3 -- the saturation block short-circuits and the original arrays are
+    passed through by identity, not multiplied by 1.0.
+  * Even with theta supplied, at spend == reference_spend the multiplier is
+    `1.0 ** theta`, exactly 1.0 in IEEE-754, and `x * 1.0 == x` bitwise. So the
+    even-$100k/channel anchor reproduces Phase 2/3 to the bit either way.
+  * THE RNG DRAW ORDER AND DRAW COUNT ARE UNTOUCHED: correlated normals, then
+    one CPC lognormal block per channel in `channels` order, then one RPC block
+    per channel. Saturation only alters the (mu, sigma) handed to
+    `rng.lognormal`; it adds no draw, removes none, and reorders none.
+
+A CONSEQUENCE OF THE SPEC WORTH KNOWING (see saturation.py for the numbers):
+only the MEAN cpc is spend-dependent by default. `fit_lognormal_moments`
+derives sigma from std/mean, so a rising mean against bronze's fixed std means
+the CPC distribution gets relatively TIGHTER as spend grows and the Jensen
+correction exp(sigma^2) shrinks. `saturate_std_cpc=True` selects the
+CV-preserving variant instead (std scaled by the same multiplier, sigma exactly
+invariant), which matches how Phase 3's scenario multipliers behave.
 
 CORRELATION -- and its limits, stated plainly:
 
@@ -46,6 +91,24 @@ from dataclasses import dataclass
 
 import numpy as np
 from scipy import stats
+
+try:  # package-style import (simulation.engine / ad_mc_sim.engine)
+    from .saturation import REFERENCE_SPEND, saturation_multiplier
+except ImportError:
+    try:  # flat import, which is how the rest of this repo runs
+        from saturation import REFERENCE_SPEND, saturation_multiplier
+    except ImportError as exc:  # pragma: no cover -- packaging mistake, not a code path
+        # This is the failure mode a Spark executor will hit if the wheel is built
+        # without saturation.py. Raising here with the fix named is worth the six
+        # lines: the alternative is a bare ModuleNotFoundError surfacing from
+        # inside a task, where it reads as "the engine is broken" rather than
+        # "the package is incomplete".
+        raise ImportError(
+            "engine.py requires saturation.py (added in Phase 4 for the spend response "
+            "curve). If this is a Spark executor, the wheel was built without it: add "
+            "'saturation.py' to PACKAGE_MODULES in simulation/run_phase3_distributed.py "
+            "and rebuild. The wheel's content hash will change, which is expected."
+        ) from exc
 
 
 # --- Method-of-moments parameter fitting ------------------------------------
@@ -141,10 +204,22 @@ class SimulationResult:
     beta_params: dict[str, tuple[float, float]]
     lognormal_cpc_params: dict[str, tuple[float, float]]
     lognormal_rpc_params: dict[str, tuple[float, float]]
+    # --- saturation (Phase 4). All None when saturation is off, so a result
+    # from the Phase 2/3 code path is distinguishable from a saturated one
+    # rather than silently looking the same.
+    theta: np.ndarray | None = None                  # (k,) CPC elasticity w.r.t. spend
+    reference_spend: float | None = None
+    saturation_multiplier: np.ndarray | None = None  # (k,) (spend/ref)**theta
+    effective_mean_cpc: np.ndarray | None = None     # (k,) mean actually fitted
+    effective_std_cpc: np.ndarray | None = None      # (k,) std actually fitted
 
     @property
     def n_paths(self) -> int:
         return self.total_revenue.shape[0]
+
+    @property
+    def is_saturated(self) -> bool:
+        return self.theta is not None
 
 
 def simulate(
@@ -159,11 +234,35 @@ def simulate(
     correlation: np.ndarray,
     n_paths: int,
     seed: int,
+    theta: np.ndarray | None = None,
+    reference_spend: float = REFERENCE_SPEND,
+    saturate_std_cpc: bool = False,
 ) -> SimulationResult:
     """Run `n_paths` correlated paths for a fixed allocation.
 
     All array arguments are indexed consistently with `channels`; the caller
     is responsible for that alignment and run_phase2_simulation.py asserts it.
+
+    SATURATION (Phase 4, opt-in):
+
+    `theta=None` -- the default -- is exactly the Phase 2/3 engine. Nothing in
+    the saturation block executes and the caller's `mean_cpc` / `std_cpc` arrays
+    reach `fit_lognormal_moments` by identity.
+
+    `theta` as a (k,) array of CPC elasticities makes the fitted mean CPC
+    spend-dependent, `mean_cpc_i * (spend_i/reference_spend) ** theta_i`, which
+    turns revenue from linear in spend into a power law with exponent
+    (1 - theta_i). `saturate_std_cpc=True` additionally scales std_cpc by the
+    same multiplier, preserving the coefficient of variation (and therefore
+    sigma, and therefore the Jensen correction) exactly; the default False
+    implements the spec as written, mean only. See `saturation.py`.
+
+    ORDER OF COMPOSITION WITH SCENARIO MULTIPLIERS. `cell.py` scales the bronze
+    moments by the scenario's `cpc_multiplier` BEFORE calling this function, so
+    the effective mean is `(bronze_mean * cpc_mult) * (spend/ref)**theta`. Both
+    factors are multiplicative on the mean, so the two orderings agree in exact
+    arithmetic; in float64 they can differ in the last ulp, so the order is
+    fixed here (scenario first, saturation second) rather than left to chance.
     """
     k = len(channels)
     for name, arr in (("mean_cvr", mean_cvr), ("std_cvr", std_cvr), ("mean_cpc", mean_cpc),
@@ -175,6 +274,22 @@ def simulate(
 
     rng = np.random.default_rng(seed)
     spend = np.array([allocation[c] for c in channels], dtype=float)
+
+    # 0. spend saturation -- the ONLY thing that changes here is the mean (and
+    #    optionally the std) handed to the CPC moment fit in step 2. No RNG call
+    #    happens in this block, so the draw order below is unaffected.
+    if theta is None:
+        sat_mult = None
+        eff_mean_cpc = mean_cpc          # by identity: not `* 1.0`
+        eff_std_cpc = std_cpc
+    else:
+        theta = np.asarray(theta, dtype=float)
+        if theta.shape != (k,):
+            raise ValueError(f"theta shape {theta.shape}, expected {(k,)}")
+        sat_mult = saturation_multiplier(spend, theta, reference_spend)
+        eff_mean_cpc = np.asarray(mean_cpc, dtype=float) * sat_mult
+        eff_std_cpc = (np.asarray(std_cpc, dtype=float) * sat_mult
+                       if saturate_std_cpc else std_cpc)
 
     # 1. correlated CVR through a Gaussian copula
     chol = cholesky_factor(correlation)
@@ -191,7 +306,7 @@ def simulate(
     cpc_params: dict[str, tuple[float, float]] = {}
     cpc = np.empty((n_paths, k))
     for i, channel in enumerate(channels):
-        mu, sigma = fit_lognormal_moments(float(mean_cpc[i]), float(std_cpc[i]))
+        mu, sigma = fit_lognormal_moments(float(eff_mean_cpc[i]), float(eff_std_cpc[i]))
         cpc_params[channel] = (mu, sigma)
         cpc[:, i] = rng.lognormal(mu, sigma, n_paths)
 
@@ -220,6 +335,11 @@ def simulate(
         beta_params=beta_params,
         lognormal_cpc_params=cpc_params,
         lognormal_rpc_params=rpc_params,
+        theta=theta,
+        reference_spend=None if theta is None else float(reference_spend),
+        saturation_multiplier=sat_mult,
+        effective_mean_cpc=None if theta is None else np.asarray(eff_mean_cpc, dtype=float),
+        effective_std_cpc=None if theta is None else np.asarray(eff_std_cpc, dtype=float),
     )
 
 
@@ -229,10 +349,46 @@ def naive_point_estimate(channels, allocation, mean_cvr, mean_cpc, mean_rpc) -> 
     """Deterministic revenue, mean assumptions plugged straight through.
 
     Per-channel array; sum it for the total.
+
+    UNDER SATURATION the caller must pass the EFFECTIVE mean CPC
+    (`saturation.effective_mean_cpc(...)`, or `result.effective_mean_cpc`), not
+    the bronze one -- otherwise this silently reports the Phase 3 linear model's
+    answer and the comparison against a saturated simulation is meaningless.
+    `analytic_expected_revenue` below does that bookkeeping automatically and is
+    the safer choice for a validation target.
     """
     spend = np.array([allocation[c] for c in channels], dtype=float)
     return (spend / np.asarray(mean_cpc, dtype=float)) * np.asarray(mean_cvr, dtype=float) \
         * np.asarray(mean_rpc, dtype=float)
+
+
+def analytic_expected_revenue(result: "SimulationResult") -> np.ndarray:
+    """Exact analytic E[revenue] per channel, reconstructed from a result's own fits.
+
+    Self-contained: every input is recovered from the fitted marginals the run
+    actually used, so it is correct with or without saturation and cannot drift
+    out of sync with the engine by using a stale mean.
+
+        E[revenue_i] = spend_i * E[1/CPC_i] * E[CVR_i] * E[RPC_i]
+        E[1/CPC]     = exp(-mu + sigma^2/2)      for LogNormal(mu, sigma)
+        E[CVR]       = a / (a + b)               for Beta(a, b)
+        E[RPC]       = exp(mu + sigma^2/2)
+
+    CVR, CPC and RPC are mutually independent in this model (only CVR is
+    correlated, and only ACROSS channels), so the expectation factorises exactly
+    and this is a hard target for the simulated mean, not an approximation.
+    """
+    spend = np.asarray(result.allocation, dtype=float)
+    out = np.empty(len(result.channels), dtype=float)
+    for i, channel in enumerate(result.channels):
+        a, b = result.beta_params[channel]
+        cpc_mu, cpc_sigma = result.lognormal_cpc_params[channel]
+        rpc_mu, rpc_sigma = result.lognormal_rpc_params[channel]
+        e_inv_cpc = np.exp(-cpc_mu + cpc_sigma ** 2 / 2.0)
+        e_cvr = a / (a + b)
+        e_rpc = np.exp(rpc_mu + rpc_sigma ** 2 / 2.0)
+        out[i] = spend[i] * e_inv_cpc * e_cvr * e_rpc
+    return out
 
 
 def jensen_corrected_expectation(naive_by_channel: np.ndarray, cpc_sigmas: np.ndarray) -> np.ndarray:

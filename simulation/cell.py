@@ -6,8 +6,46 @@ The Spark layer's `applyInPandas` / `mapInPandas` UDF calls `simulate_cell` and
 nothing else, so the modelling can be unit-tested on a laptop and the same code
 path is exercised locally and on a cluster.
 
-The Phase 2 engine (`engine.simulate`) is treated as FROZEN. This module wraps
-it; it never reimplements or adjusts its maths.
+This module wraps `engine.simulate`; it never reimplements or adjusts its maths.
+(Through Phase 3 the engine was literally frozen at its Phase 2 bytes. Phase 4
+added an opt-in spend-saturation curve to it -- see `engine.py` and
+`saturation.py`. This module only THREADS the new parameters through; the wrap
+is still a wrap.)
+
+
+SATURATION AND SCENARIO MULTIPLIERS COMPOSE MULTIPLICATIVELY
+============================================================
+Both act on the mean CPC. The order fixed here is SCENARIO FIRST, SATURATION
+SECOND:
+
+    effective_mean_cpc = (bronze_mean_cpc * cpc_multiplier) * (spend/ref)**theta
+
+`_scale` applies the scenario here, on the moment vector; the engine applies the
+saturation multiplier to whatever mean it receives. In exact arithmetic the two
+orderings are identical -- both are the product of the same three factors -- so
+the composition is commutative and there is no modelling question to settle.
+
+In float64 it is NOT bitwise commutative, and that was measured rather than
+assumed. Across all 21 allocations x 4 scenarios x 5 channels = 420 effective
+means on the real bronze moments, scenario-first and saturation-first agree
+bitwise on 313 of 420 (74.5%) and differ by at most 1 ulp on the rest (worst
+relative difference 2.203e-16, worst absolute difference 4.4e-16 dollars on a
+CPC). So the order is fixed here rather than left implicit -- but nothing
+downstream can detect the difference, and the `normal` scenario, where
+`cpc_multiplier` is exactly 1.0, is bitwise identical either way for all 21
+allocations, which is what the Phase 2/3 anchor equivalence depends on.
+
+The economic reading is the intended one: in a seasonal peak the auction is
+hotter for everyone (the scenario factor) AND you still pay a volume premium for
+buying a large position in a channel (the saturation factor). Neither cancels
+the other.
+
+`std_cpc` follows a DIFFERENT rule for the two, and that asymmetry is deliberate
+and comes from the spec. The scenario multiplier scales mean and std together
+(CV-preserving). Saturation scales only the mean by default, so the CPC
+coefficient of variation FALLS as spend rises. `saturate_std_cpc=True` makes
+saturation CV-preserving too; it is off by default because the spec says
+mean-only. See `saturation.py` for how far the CV actually moves.
 
 
 WHERE THE SCENARIO MULTIPLIERS ARE APPLIED, AND WHY
@@ -81,19 +119,20 @@ Restated here because they now propagate into 84 cells rather than one:
   * The correlation matrix is held FIXED across scenarios. Real correlations
     rise in a downturn, so the recession scenario's tail risk is understated in
     a way this model cannot show.
-  * Revenue is exactly linear in spend -- there is NO saturation / diminishing
-    returns curve -- so expected revenue is a linear function of the allocation
-    weights and is maximised at a corner of the simplex. On the current bronze
-    assumptions paid_search has an expected ROAS of 3.26x per dollar against
-    1.97x for the next best channel, a 65% edge, which is large enough that
-    concentrating into it raises the 5th percentile as well as the mean.
-    Measured over the 21 Phase 3 candidates: 100% paid_search maximises
-    E[revenue], VaR-95 AND CVaR-95 simultaneously, in all four scenarios, so a
-    mean-VaR or mean-CVaR "efficient frontier" over this model collapses to a
-    single point. Only mean-VARIANCE shows a genuine tradeoff (13 of 21
-    candidates non-dominated). Phase 4 needs to know this before it tries to
-    trace a frontier: without a spend response curve the interesting structure
-    is in the variance, not in the downside quantiles.
+  * Revenue was exactly linear in spend through Phase 3 -- no saturation /
+    diminishing returns curve -- so expected revenue was a linear function of
+    the allocation weights and was maximised at a corner of the simplex. On the
+    bronze assumptions paid_search has an expected ROAS of 3.26x per dollar
+    against 1.97x for the next best channel, a 65% edge, large enough that
+    concentrating into it raised the 5th percentile as well as the mean.
+    Measured over the 21 Phase 3 candidates, `dominant_paid_search` maximised
+    E[revenue], VaR-95 AND CVaR-95 simultaneously in all four scenarios, so a
+    mean-VaR or mean-CVaR "efficient frontier" over that model collapsed to a
+    single point.
+    FIXED IN PHASE 4, opt-in: pass `theta` to get the saturation curve, which
+    makes each channel's contribution strictly concave and moves the optimum off
+    the corner. Leaving `theta=None` reproduces the linear Phase 2/3 model
+    exactly, so both models remain runnable from this one code path.
   * Multipliers are uniform across channels and deterministic, contributing no
     variance of their own.
 """
@@ -105,8 +144,10 @@ import pandas as pd
 
 try:  # package-style import (simulation.cell)
     from . import engine
+    from .saturation import REFERENCE_SPEND
 except ImportError:  # flat import, which is how the rest of this repo runs
     import engine
+    from saturation import REFERENCE_SPEND
 
 
 # Output contract, kept next to the code that produces it so the Spark layer
@@ -236,12 +277,20 @@ def simulate_cell(
     revenue_multiplier: float,
     n_paths: int,
     seed: int,
+    theta=None,
+    reference_spend: float = REFERENCE_SPEND,
+    saturate_std_cpc: bool = False,
 ) -> pd.DataFrame:
     """Run one (allocation, scenario) cell and return one row per path.
 
     All moment arrays are indexed consistently with `channels`; the caller owns
     that alignment (`data_access.load_assumptions` orders by channel_id and
     `load_correlation_matrix` reindexes the matrix to match).
+
+    `theta=None` (default) is the linear Phase 2/3 model, unchanged. A (k,)
+    array of CPC elasticities aligned to `channels` turns on the Phase 4
+    saturation curve; see the module docstring for how it composes with the
+    scenario multiplier, and `saturation.theta_vector` for building the array.
 
     Returns columns `CELL_OUTPUT_COLUMNS`, with `path_number` 0-based and in
     the engine's natural path order (path i is the i-th row of the engine's
@@ -270,7 +319,7 @@ def simulate_cell(
 
     _check_scaled_cvr_legal(channels, s_mean_cvr, s_std_cvr, scenario_id, cvr_multiplier)
 
-    # --- frozen Phase 2 engine, called unmodified ---
+    # --- engine called unmodified; saturation is threaded through, not applied here ---
     result = engine.simulate(
         channels=channels,
         allocation=allocation,
@@ -283,6 +332,9 @@ def simulate_cell(
         correlation=np.asarray(correlation, dtype=float),
         n_paths=n_paths,
         seed=seed,
+        theta=theta,
+        reference_spend=reference_spend,
+        saturate_std_cpc=saturate_std_cpc,
     )
 
     total_spend = float(result.allocation.sum())
@@ -308,6 +360,9 @@ def simulate_cell_from_scenario(
     correlation,
     n_paths: int,
     seed: int,
+    theta=None,
+    reference_spend: float = REFERENCE_SPEND,
+    saturate_std_cpc: bool = False,
 ) -> pd.DataFrame:
     """Convenience wrapper taking a `scenarios.Scenario` instead of loose floats.
 
@@ -329,4 +384,7 @@ def simulate_cell_from_scenario(
         revenue_multiplier=scenario.revenue_multiplier,
         n_paths=n_paths,
         seed=seed,
+        theta=theta,
+        reference_spend=reference_spend,
+        saturate_std_cpc=saturate_std_cpc,
     )

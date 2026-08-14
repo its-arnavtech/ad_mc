@@ -18,6 +18,11 @@ data/processed/
 # --- Validation output ---
 data/validation/*.png
 
+# --- Local agent config ---
+# Subagent definitions for this session's tooling. Untracked on purpose, and
+# listed here so `git add -A` cannot sweep them into a commit by accident.
+.claude/
+
 # --- Python ---
 __pycache__/
 *.py[cod]
