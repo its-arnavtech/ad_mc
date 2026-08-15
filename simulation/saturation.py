@@ -239,6 +239,55 @@ BRONZE_AVG_IMPRESSIONS_PER_DAY: dict[str, float] = {
     "video": 100898.83561643836,
 }
 
+# --- Spend floor: where the curve stops having evidence ----------------------
+# The curve is a penalty above `reference_spend` and a DISCOUNT below it, and it
+# has no lower bound: as spend -> 0 it prices clicks arbitrarily cheaply. Phase 4
+# showed that is not hypothetical -- a simplex search put a frontier point at $56
+# in a channel, about three orders of magnitude below anything bronze has seen,
+# and priced its clicks accordingly.
+#
+# So the INPUT to the curve is clipped at a per-channel floor: below the floor,
+# the formula is evaluated AT the floor rather than at the actual spend. Clipping
+# the input rather than the output means the curve is simply not consulted where
+# it has nothing to say, while every allocation at or above the floor is bitwise
+# unaffected.
+#
+# WHICH PERCENTILE, AND WHY p5. Each channel has 730 daily observations. p5 sits
+# above ~36 of them, which is where the empirical support genuinely thins -- far
+# enough into the tail to be the honest edge of the evidence, but not the single
+# minimum, which is one day out of two years and would make the bound hostage to
+# one outlier. p1 / p5 / p10 were all measured and clip 17.20% / 17.82% / 18.33%
+# of the 971 sweep candidates -- a spread of 1.1 points -- so the choice governs
+# how far the clipped candidates move rather than how many there are.
+# p5 is an ASSUMPTION, in the same class as theta_min and k.
+#
+# (An earlier draft of this comment said 28.7% / 29.4% / 30.0%. Those figures
+# counted ZERO-spend channels as clipped, which contradicts the paragraph above:
+# 114 of the 971 candidates have a channel at exactly $0 and none of them is
+# clipped. Do not reintroduce them.)
+#
+# GRAIN CAVEAT, stated because it is real: bronze spend is per DAY ($243-$6,716
+# across channels), while the $500,000 budget and $100,000 reference carry no
+# stated time grain. Comparing an allocation's channel spend to a daily floor
+# inherits exactly the grain mismatch already recorded for `reference_spend`.
+# Bounding the curve by observed data rather than a round number is still the
+# right SHAPE of fix, but it does not resolve the grain question and should not
+# be read as if it did.
+BRONZE_SPEND_FLOOR_PERCENTILE: float = 0.05
+
+# PERCENTILE(spend, 0.05) per channel from `bronze.channel_performance_history`
+# (730 days, 2024-01-01..2025-12-30), read live on 2026-08-14. Frozen for the
+# same reason as the impressions snapshot: usable on an executor without a
+# warehouse round trip. `check_spend_floor_snapshot` re-validates it.
+BRONZE_SPEND_FLOOR_PER_DAY: dict[str, float] = {
+    "display": 311.0,
+    "paid_search": 2755.0,
+    "paid_social": 834.0,
+    "programmatic": 552.0,
+    "video": 1300.0,
+}
+
+
 # theta must stay in [0, 1). theta = 0 is "no saturation"; theta >= 1 makes
 # clicks flat or DECREASING in spend, which is not diminishing returns, it is a
 # broken model. Rejected rather than clamped.
@@ -346,10 +395,89 @@ def check_impressions_snapshot(
 
 # --- The curve ---------------------------------------------------------------
 
+def spend_floor_vector(
+    channels: list[str], floors: dict[str, float] | None = None
+) -> np.ndarray:
+    """Per-channel floor aligned to `channels`, in the caller's order.
+
+    Raises on a missing channel rather than defaulting to 0.0, because a silent
+    zero floor would restore exactly the unbounded extrapolation this exists to
+    prevent.
+    """
+    floors = BRONZE_SPEND_FLOOR_PER_DAY if floors is None else floors
+    missing = [c for c in channels if c not in floors]
+    if missing:
+        raise ValueError(
+            f"no spend floor for {missing}; refusing to default to 0.0, which would "
+            f"silently re-enable unbounded CPC extrapolation for those channels"
+        )
+    out = np.array([float(floors[c]) for c in channels], dtype=float)
+    if not np.all(np.isfinite(out)) or np.any(out <= 0):
+        raise ValueError(f"spend floors must be finite and > 0, got {out.tolist()}")
+    return out
+
+
+def apply_spend_floor(
+    spend: np.ndarray, spend_floor: "np.ndarray | None"
+) -> tuple[np.ndarray, np.ndarray]:
+    """Clip the curve's INPUT at the floor. Returns `(clipped_spend, was_clipped)`.
+
+    ZERO SPEND IS NOT CLIPPED, and that distinction carries the whole design. A
+    channel at zero is not underfunded, it is UNFUNDED: it must earn exactly
+    nothing, and lifting it to the floor would invent a channel the allocation
+    never bought. Only strictly positive spend BELOW the floor is clipped -- that
+    channel really was funded, we simply have no evidence about CPC down there,
+    so the curve is evaluated at the edge of the evidence instead.
+
+    The clip moves only the CPC MEAN fed to the fit. `clicks = actual_spend /
+    drawn_CPC` still uses the real spend, so a clipped channel buys the clicks
+    its real budget affords at a defensible price; it is not credited with the
+    floor's budget.
+    """
+    spend = np.asarray(spend, dtype=float)
+    if spend_floor is None:
+        return spend, np.zeros(spend.shape, dtype=bool)
+    floor = np.asarray(spend_floor, dtype=float)
+    if floor.shape != spend.shape:
+        raise ValueError(f"spend_floor shape {floor.shape} != spend shape {spend.shape}")
+    was_clipped = (spend > 0.0) & (spend < floor)
+    if not np.any(was_clipped):
+        return spend, was_clipped
+    return np.where(was_clipped, floor, spend), was_clipped
+
+
+def check_spend_floor_snapshot(
+    live: dict[str, float], rtol: float = 1e-03
+) -> dict[str, float]:
+    """Relative difference between the frozen floors and a live recomputation.
+
+    TOLERANCE, and why it is not 1e-9 like the impressions snapshot. The frozen
+    floors are the live p5 ROUNDED TO THE DOLLAR, deliberately, so they read as
+    the money amounts they are. Rounding $311.2315 to $311 is a 7.4e-04 relative
+    move, so a 1e-9 tolerance would make this function raise on correct data --
+    which it did, until this was fixed. 1e-3 admits the rounding and still
+    catches anything that has actually shifted: a one-dollar error on the
+    smallest floor is 3.2e-03, comfortably outside it.
+    """
+    diffs = {}
+    for channel, frozen in BRONZE_SPEND_FLOOR_PER_DAY.items():
+        if channel not in live:
+            raise ValueError(f"live spend floors are missing {channel!r}")
+        diffs[channel] = abs(live[channel] - frozen) / frozen
+    worst = max(diffs.values())
+    if worst > rtol:
+        raise ValueError(
+            f"frozen spend floors disagree with live bronze by {worst:.3e} "
+            f"(tolerance {rtol:.0e}): {diffs}"
+        )
+    return diffs
+
+
 def saturation_multiplier(
     spend: np.ndarray,
     theta: np.ndarray,
     reference_spend: float = REFERENCE_SPEND,
+    spend_floor: "np.ndarray | None" = None,
 ) -> np.ndarray:
     """(spend / reference_spend) ** theta, elementwise, with the edge cases nailed down.
 
@@ -394,10 +522,14 @@ def saturation_multiplier(
         )
     validate_theta_mapping({f"index {i}": t for i, t in enumerate(theta)})
 
+    # Clip the INPUT, so the curve is never evaluated below the evidence.
+    # Zero spend passes through unclipped and still yields exactly 0.0.
+    curve_spend, _clipped = apply_spend_floor(spend, spend_floor)
+
     mult = np.ones_like(spend)
     active = theta != 0.0
     if np.any(active):
-        mult[active] = (spend[active] / reference_spend) ** theta[active]
+        mult[active] = (curve_spend[active] / reference_spend) ** theta[active]
     return mult
 
 
@@ -408,10 +540,11 @@ def effective_cpc_moments(
     theta: np.ndarray,
     reference_spend: float = REFERENCE_SPEND,
     saturate_std_cpc: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """CPC moments to FIT, the true multiplier, and which channels are idle.
+    spend_floor: "np.ndarray | None" = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """CPC moments to FIT, the multiplier, the idle mask, and the floor mask.
 
-    Returns `(fit_mean_cpc, fit_std_cpc, multiplier, idle_mask)`.
+    Returns `(fit_mean_cpc, fit_std_cpc, multiplier, idle_mask, floor_mask)`.
 
     `multiplier` is the exact `(spend/ref)**theta`, so it is 0.0 for a channel at
     zero spend. `fit_mean_cpc` / `fit_std_cpc` are what a lognormal moment fit can
@@ -428,7 +561,8 @@ def effective_cpc_moments(
     reference point and passing `std_cpc` through untouched when
     `saturate_std_cpc` is False.
     """
-    mult = saturation_multiplier(spend, theta, reference_spend)
+    _curve_spend, floored = apply_spend_floor(spend, spend_floor)
+    mult = saturation_multiplier(spend, theta, reference_spend, spend_floor)
     fit_mean = np.asarray(mean_cpc, dtype=float) * mult
     fit_std = (np.asarray(std_cpc, dtype=float) * mult
                if saturate_std_cpc else np.asarray(std_cpc, dtype=float))
@@ -436,7 +570,7 @@ def effective_cpc_moments(
     if np.any(idle):
         fit_mean = np.where(idle, np.asarray(mean_cpc, dtype=float), fit_mean)
         fit_std = np.where(idle, np.asarray(std_cpc, dtype=float), fit_std)
-    return fit_mean, fit_std, mult, idle
+    return fit_mean, fit_std, mult, idle, floored
 
 
 def effective_mean_cpc(
@@ -444,10 +578,11 @@ def effective_mean_cpc(
     spend: np.ndarray,
     theta: np.ndarray,
     reference_spend: float = REFERENCE_SPEND,
+    spend_floor: "np.ndarray | None" = None,
 ) -> np.ndarray:
-    """mean_cpc * (spend / reference_spend) ** theta."""
+    """mean_cpc * (max(spend, floor) / reference_spend) ** theta."""
     return np.asarray(mean_cpc, dtype=float) * saturation_multiplier(
-        spend, theta, reference_spend
+        spend, theta, reference_spend, spend_floor
     )
 
 

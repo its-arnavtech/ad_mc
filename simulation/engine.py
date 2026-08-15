@@ -222,6 +222,11 @@ class SimulationResult:
     theta: np.ndarray | None = None                  # (k,) CPC elasticity w.r.t. spend
     reference_spend: float | None = None
     saturation_multiplier: np.ndarray | None = None  # (k,) (spend/ref)**theta, 0.0 if idle
+    # (k,) True where the channel was funded BELOW its evidence floor, so the
+    # curve was evaluated at the floor instead of at the actual spend. Surfaced
+    # rather than buried: an allocation relying on the clip is priced at the
+    # edge of the data, not inside it. All False when no floor is supplied.
+    spend_floor_applied: np.ndarray | None = None
     effective_mean_cpc: np.ndarray | None = None     # (k,) mean actually fitted
     effective_std_cpc: np.ndarray | None = None      # (k,) std actually fitted
     # (k,) True where spend == 0. Those channels contribute exactly zero clicks,
@@ -255,6 +260,7 @@ def simulate(
     theta: np.ndarray | None = None,
     reference_spend: float = REFERENCE_SPEND,
     saturate_std_cpc: bool = False,
+    spend_floor: np.ndarray | None = None,
 ) -> SimulationResult:
     """Run `n_paths` correlated paths for a fixed allocation.
 
@@ -313,14 +319,22 @@ def simulate(
     if theta is None:
         sat_mult = None
         idle = None
+        floored = np.zeros(k, dtype=bool)
         eff_mean_cpc = mean_cpc          # by identity: not `* 1.0`
         eff_std_cpc = std_cpc
     else:
         theta = np.asarray(theta, dtype=float)
         if theta.shape != (k,):
             raise ValueError(f"theta shape {theta.shape}, expected {(k,)}")
-        eff_mean_cpc, eff_std_cpc, sat_mult, idle = effective_cpc_moments(
-            mean_cpc, std_cpc, spend, theta, reference_spend, saturate_std_cpc
+        if spend_floor is not None:
+            spend_floor = np.asarray(spend_floor, dtype=float)
+            if spend_floor.shape != (k,):
+                raise ValueError(
+                    f"spend_floor shape {spend_floor.shape}, expected {(k,)}"
+                )
+        eff_mean_cpc, eff_std_cpc, sat_mult, idle, floored = effective_cpc_moments(
+            mean_cpc, std_cpc, spend, theta, reference_spend, saturate_std_cpc,
+            spend_floor,
         )
 
     # 1. correlated CVR through a Gaussian copula
@@ -382,6 +396,7 @@ def simulate(
         theta=theta,
         reference_spend=None if theta is None else float(reference_spend),
         saturation_multiplier=sat_mult,
+        spend_floor_applied=floored,
         effective_mean_cpc=None if theta is None else np.asarray(eff_mean_cpc, dtype=float),
         effective_std_cpc=None if theta is None else np.asarray(eff_std_cpc, dtype=float),
         idle_channel=idle,

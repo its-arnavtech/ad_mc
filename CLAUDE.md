@@ -532,6 +532,139 @@ Structured to demonstrate three roles in one system:
   true of the VARIANCE frontier and **false of both risk-floor frontiers**,
   which lean on it less. Phase 6 should not present frontier allocations without this
   caveat, and a spend floor is the obvious mitigation.
+- **Phase 4 follow-up (spend floor on the CPC curve):** on branch
+  `phase-4-spend-floor` (branched off `phase-4-optimization` at `9df9c1c`).
+  Bounds the saturation curve at the low end so it stops extrapolating CPC
+  below anything bronze has observed. NOT Phase 5.
+
+  **Floors are p5 of each channel's observed DAILY spend** over 730 days:
+  display $311, programmatic $552, paid_social $834, video $1,300,
+  paid_search $2,755. p5 sits above 37 of the 730 daily observations — far
+  enough into the tail to be the honest edge of the evidence, but not the
+  single minimum, which is one day in two years and would make the bound
+  hostage to an outlier. p1/p5/p10 clip **17.20%/17.82%/18.33%** of the 971
+  candidates, a spread of 1.1 points, so the choice governs how far clipped
+  candidates move rather than how many. p5 is an ASSUMPTION, same class as
+  `theta_min` and `k`. (An earlier draft said 28.7%/29.4%/30.0%; those counted
+  zero-spend channels as clipped, which the rule explicitly does not.)
+
+  **The INPUT is clipped, not the output.** Below the floor the curve is
+  evaluated AT the floor. Two consequences worth stating:
+  - `clicks = actual_spend / drawn_CPC` still uses REAL spend, so a clipped
+    channel buys what its budget affords at a defensible price — it is not
+    credited with the floor's budget.
+  - **Zero spend is NOT clipped.** A channel at zero is unfunded, not
+    underfunded; lifting it to the floor would invent a channel the
+    allocation never bought. Only strictly positive sub-floor spend clips.
+
+  **Anchor regression is BITWISE in all four combinations** (theta on/off x
+  floor on/off), max abs diff 0.000e+00 vs `9df9c1c`, and the anchor's floor
+  mask is all-False. The largest floor is 0.0276x reference.
+  **But the anchor is BLIND to the floor**, exactly as it is blind to theta:
+  every floor is <= 0.028x reference, so at the anchor `floor=None`,
+  `floor=BRONZE` and `floor=[1,1,1,1,1]` are indistinguishable. It only becomes
+  sensitive above the reference. What actually covers the floor is the per-cell
+  re-simulation, the independent flag reconciliation, and the unclipped-vs-
+  clipped split below.
+
+  **THE FIX BOUNDS THE PRICING, NOT THE SEARCH — read this before claiming it
+  removed the extrapolation.** Measured, `normal`, 971 candidates:
+  - Allocations with no clipped channel changed by **exactly $0.00**. The
+    floor is surgical.
+  - Clipped allocations lose 0% to 1.69% of expected revenue (mean −0.48%).
+  - **The thin points are still on the frontier.** Pre-floor the thinnest
+    funded channel on a mean-std frontier point was $56 (0.00056x ref);
+    post-floor it is **$1** (0.00001x ref). The floor stops such a channel
+    being PRICED at an ungrounded CPC; it does nothing to stop the optimizer
+    PROPOSING it. Bounding the search itself would be a separate change — a
+    constraint in the candidate generator or a penalty term.
+  - **The "0% to 1.69%" figure UNDERSELLS what was removed — it is small only
+    because thin channels hold tiny budgets.** Per channel the singularity was
+    enormous: at $1 in paid_search the unbounded curve implies a marginal ROAS
+    of **3,905x** against 3.26x at reference, and at $56 it implies 98x. The
+    distortion is amplified by the mean-only `std_cpc` spec, which leaves the
+    fitted sigma at 1.744 and the Jensen factor `exp(sigma^2)` at **20.9** at
+    $1, versus 1.08 at the floor. The floor caps that channel at 12.4x. So the
+    fix removes an unbounded per-channel singularity; the aggregate revenue
+    effect is small because the singularity sits on tiny budgets.
+  - What REMAINS ungrounded: even at the floor a channel is priced 2.0x-3.5x
+    cheaper than its bronze mean CPC, and the whole interval between the floor
+    and the reference is the interval bronze cannot identify.
+  - So the honest claim is: the numbers on the frontier are now defensible,
+    and where they still rest on the edge of the data the row says so.
+
+  **RECOMMENDATION CHANGES ARE ALMOST ENTIRELY INDIRECT — through the adaptive
+  search, not by re-ranking a fixed set.** 17 of 36 recommendations changed.
+  Holding the candidate set FIXED at the 799 common candidates the repricing
+  alone gives mean-VaR 6 -> 6 (all kept), mean-CVaR 5 -> 5 (all kept), mean-std
+  76 -> 77 (75 kept) — so re-ranking a fixed set moves almost nothing. What
+  actually moved the answer is that the repricing shifted the stage-1 Pareto
+  union 53 -> 51, which changed the points stage 2 blends around, so 172 of 971
+  candidates differ between runs and 64% of frontier membership turned over.
+  **Do NOT call the search path a separate cause or a confounder** — an earlier
+  draft did, and that treats a downstream consequence of the fix as if it were
+  exogenous. The floor is the only input that changed.
+  Best expected revenue is `dir1_110` both before and after
+  ($1,054,860 -> $1,054,691, itself a clipped allocation).
+
+  **Gold carries the caveat, same pattern as `ordering_unresolved`:**
+  `extrapolation_floor_applied` on all three tables plus `n_channels_floored`
+  on the sweep. Live: 692 of 3,884 sweep rows flagged (173 candidates x 4
+  scenarios), 50 of 519 frontier rows, **16 of 36 recommendations**.
+  `ordering_unresolved` moved 6 -> 11 of 36. That is NOT "unrelated to the
+  floor" (an earlier draft said so and it is wrong — the floor is the only
+  changed input). Decomposed: on the fixed 799 common candidates the repricing
+  moves it 5 -> 1, i.e. DOWN; the rise to 11 comes entirely from the different
+  stage-2 blend set, which the floor caused. Same indirect mechanism as the
+  recommendation changes above. Phase 6 must respect both flags.
+
+  **`verifier` (2026-08-15) against live Databricks — PASS on data, PARTIAL on
+  the prose.** It re-ran the entire two-stage sweep TWICE itself (floor on and
+  off) and reproduced live gold bitwise on all 3,884 cells, all 12 frontier
+  sets by membership, and all 36 recommendations. It independently recomputed
+  the flags from its own bronze-derived floors: 0 mismatches on every row, with
+  five negative controls that discriminate. CRN determinism re-verified on 12
+  live cells including 6 clipped ones (max rel 0.000e+00) with 7 failing
+  negative controls. Silver confirmed untouched, and the floor is a NO-OP on
+  the whole Phase 3 grid (its minimum channel spend is $25,000, above every
+  floor), so Phase 3's guarantee is intact.
+
+  It found four real defects, all since fixed: (1) `check_spend_floor_snapshot`
+  was never called AND its 1e-9 default tolerance made it raise on correct data,
+  since the frozen floors are deliberately rounded to the dollar (7.4e-04) — the
+  tolerance is now 1e-3 and `load_phase4_gold` calls it; (2) the p1/p5/p10 clip
+  figures were wrong (see above); (3) `analytic_expected_revenue_weights`,
+  `subsidy_decomposition`, `marginal_roas` and `analytic_interior_optimum` were
+  floor-UNAWARE, so the repo's own analytic cross-checks disagreed with the
+  engine by +0.41% mean on exactly the clipped group — now floor-aware, and the
+  clipped-group bias is -0.00094 against the unclipped group's -0.00095, i.e.
+  gone; `marginal_roas` is now a central difference on the analytic revenue so
+  it cannot drift again, and it still reproduces the prerequisite's published
+  values exactly; (4) `SweepInputs(spend_floor=np.zeros(5))` was ACCEPTED and
+  silently reverted to unbounded behaviour — degenerate floors now raise. Plus:
+  the new gold columns carried no COMMENT because `ALTER TABLE ADD COLUMNS`
+  omitted them and no repo script performed the migration; `08_create_gold_
+  frontier.py` now re-applies every column comment idempotently on each run.
+
+  **OPEN ISSUE AGAINST THE SATURATION PREREQUISITE — do not act on it without a
+  decision, it would invalidate the whole Phase 4 sweep.** The verifier
+  regressed log(CPC) on log(spend) in bronze and got slopes that are
+  essentially UNIFORM: display 0.131, programmatic 0.123, video 0.123,
+  paid_social 0.102, paid_search **0.105** (se ~0.012, all t > 8). Published
+  theta runs 0.120 to **0.352**, and paid_search — the channel whose high theta
+  breaks the corner — measures the LOWEST slope of the five. Separately, every
+  channel's entire observed daily spend range sits below **0.07x reference**,
+  so the curve evaluated where bronze actually measured CPC predicts one-half
+  to one-third of the CPC observed there. `reference_spend = $100,000` is
+  therefore not merely unsupported at the daily grain, it is contradicted by
+  it. CLAUDE.md claims theta is "genuinely measurable as the slope of log(avg
+  CPC) on log(spend) — a testable assumption"; run against this project's own
+  bronze, that test does not corroborate the published values. Caveat on the
+  caveat: daily spend varies only ~2-3x within a channel, which may be too
+  little leverage to identify a per-channel elasticity, so this is arguably
+  "unconfirmed" rather than "refuted". Either way the ordering story is not
+  currently supported by data, and Phase 6 must not present theta as measured.
+
 - **Later:** Phase 5 (Workflows +
   MLflow orchestration), Phase 6 (analysis & reporting).
 

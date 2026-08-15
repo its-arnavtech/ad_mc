@@ -62,6 +62,17 @@ def check(label: str, ok: bool, detail: str = "") -> None:
         FAILURES.append(label)
 
 
+# Applied on every run, so metadata converges even on tables whose columns were
+# added by ALTER after the original CREATE.
+COLUMN_COMMENTS: list[tuple[str, str, str]] = [
+    (TBL_SWEEP, "extrapolation_floor_applied", "TRUE when at least one funded channel in this allocation fell below its per-channel evidence floor (p5 of that channel's observed daily spend), so its CPC was priced AT the floor rather than extrapolated below anything bronze has observed. Respect this the same way as ordering_unresolved: the number is defensible, but it sits at the edge of what the data can support."),
+    (TBL_SWEEP, "n_channels_floored",
+     "How many channels were clipped to their evidence floor; 0 means the whole "
+     "allocation sits inside the observed spend range."),
+    (TBL_FRONTIER, "extrapolation_floor_applied", "TRUE when at least one funded channel in this allocation fell below its per-channel evidence floor (p5 of that channel's observed daily spend), so its CPC was priced AT the floor rather than extrapolated below anything bronze has observed. Respect this the same way as ordering_unresolved: the number is defensible, but it sits at the edge of what the data can support."),
+    (TBL_RECS, "extrapolation_floor_applied", "TRUE when at least one funded channel in this allocation fell below its per-channel evidence floor (p5 of that channel's observed daily spend), so its CPC was priced AT the floor rather than extrapolated below anything bronze has observed. Respect this the same way as ordering_unresolved: the number is defensible, but it sits at the edge of what the data can support."),
+]
+
 DDL = [
     (TBL_SWEEP, f"""
         CREATE TABLE IF NOT EXISTS {TBL_SWEEP} (
@@ -80,7 +91,9 @@ DDL = [
             max_revenue       DOUBLE,
             var_95            DOUBLE  COMMENT 'VaR-95: 5th percentile of revenue. HIGHER is better',
             cvar_95           DOUBLE  COMMENT 'CVaR-95: mean of the worst 5% of paths. HIGHER is better',
-            expected_roas     DOUBLE  COMMENT 'mean_revenue / total_spend'
+            expected_roas     DOUBLE  COMMENT 'mean_revenue / total_spend',
+            extrapolation_floor_applied BOOLEAN COMMENT 'TRUE when at least one funded channel in this allocation fell below its per-channel evidence floor, so its CPC was priced AT the floor rather than extrapolated below the observed data. Respect this the same way as ordering_unresolved: the number is defensible, but it sits at the edge of what bronze can support.',
+            n_channels_floored INT    COMMENT 'How many channels were clipped; 0 means the allocation is entirely inside the observed range'
         )
         USING DELTA
         COMMENT 'Phase 4 optimization sweep: risk and return for every candidate allocation under every scenario. One row per (allocation, scenario) -- path level stays in silver.'
@@ -95,7 +108,8 @@ DDL = [
             var_95            DOUBLE,
             cvar_95           DOUBLE,
             expected_roas     DOUBLE,
-            rank_by_return    INT     COMMENT 'Position along the frontier, 1 = highest expected revenue'
+            rank_by_return    INT     COMMENT 'Position along the frontier, 1 = highest expected revenue',
+            extrapolation_floor_applied BOOLEAN COMMENT 'TRUE when at least one funded channel in this allocation fell below its per-channel evidence floor, so its CPC was priced AT the floor rather than extrapolated below the observed data. Respect this the same way as ordering_unresolved: the number is defensible, but it sits at the edge of what bronze can support.'
         )
         USING DELTA
         COMMENT 'The non-dominated (Pareto-efficient) allocations per scenario and objective pair. Derived from allocation_sweep_results.'
@@ -114,7 +128,8 @@ DDL = [
             n_efficient            INT     COMMENT 'How many points the frontier had -- context for whether "balanced" was meaningful',
             balanced_is_degenerate BOOLEAN COMMENT 'TRUE when the frontier had fewer than 3 points, so the knee is an endpoint rather than a considered interior choice',
             nearest_neighbour_gap  DOUBLE  COMMENT 'Distance along the return axis from this pick to the closest other efficient point',
-            ordering_unresolved    BOOLEAN COMMENT 'TRUE when that gap is under 2x the measured CRN noise, i.e. this pick is not distinguishable from its neighbour by this sweep. A frontier can be non-degenerate and still not ordered.'
+            ordering_unresolved    BOOLEAN COMMENT 'TRUE when that gap is under 2x the measured CRN noise, i.e. this pick is not distinguishable from its neighbour by this sweep. A frontier can be non-degenerate and still not ordered.',
+            extrapolation_floor_applied BOOLEAN COMMENT 'TRUE when at least one funded channel in this allocation fell below its per-channel evidence floor, so its CPC was priced AT the floor rather than extrapolated below the observed data. Respect this the same way as ordering_unresolved: the number is defensible, but it sits at the edge of what bronze can support.'
         )
         USING DELTA
         COMMENT 'Three named picks per scenario and objective pair under a fixed, stated rule. Reproducible rather than hand-chosen.'
@@ -136,11 +151,29 @@ def main() -> None:
         sql(w, wid, ddl)
         print(f"  created/verified {name}")
 
+    # CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so a column
+    # added later by ALTER TABLE carries no comment and the DDL above cannot
+    # supply one. That is exactly what happened to the spend-floor columns.
+    # Re-applying every comment on each run makes the metadata converge instead
+    # of depending on whether a table happened to be created before or after a
+    # column existed.
+    print("\n-- re-applying column comments (idempotent) --")
+    applied = 0
+    for table, column, comment in COLUMN_COMMENTS:
+        try:
+            sql(w, wid,
+                f"ALTER TABLE {table} ALTER COLUMN {column} "
+                f"COMMENT '{comment.replace(chr(39), chr(39) * 2)}'")
+            applied += 1
+        except Exception as exc:  # noqa: BLE001 -- reported, not swallowed
+            print(f"  WARN {table}.{column}: {str(exc)[:100]}")
+    print(f"  applied {applied} of {len(COLUMN_COMMENTS)} column comments")
+
     print("\n-- schemas as they now exist --")
     expected = {
-        TBL_SWEEP: 16,
-        TBL_FRONTIER: 9,
-        TBL_RECS: 13,
+        TBL_SWEEP: 18,
+        TBL_FRONTIER: 10,
+        TBL_RECS: 14,
     }
     for name, n_expected in expected.items():
         cols, rows = sql(w, wid, f"DESCRIBE TABLE {name}")

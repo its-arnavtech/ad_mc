@@ -133,7 +133,8 @@ try:  # package-style import (simulation.frontier / ad_mc_sim.frontier)
     from . import cell, engine
     from .allocations import build_allocation_candidates
     from .config import TOTAL_BUDGET
-    from .saturation import REFERENCE_SPEND, theta_vector
+    from . import saturation
+    from .saturation import REFERENCE_SPEND, spend_floor_vector, theta_vector
     from .scenarios import SCENARIOS, Scenario
     from .seeding import MASTER_SEED, stable_hash_int
     from .sweep_seeding import crn_seed
@@ -142,7 +143,8 @@ except ImportError:  # flat import, which is how the rest of this repo runs
     import engine
     from allocations import build_allocation_candidates
     from config import TOTAL_BUDGET
-    from saturation import REFERENCE_SPEND, theta_vector
+    import saturation
+    from saturation import REFERENCE_SPEND, spend_floor_vector, theta_vector
     from scenarios import SCENARIOS, Scenario
     from seeding import MASTER_SEED, stable_hash_int
     from sweep_seeding import crn_seed
@@ -167,6 +169,8 @@ SWEEP_OUTPUT_COLUMNS: tuple[str, ...] = (
     "var_95",
     "cvar_95",
     "expected_roas",
+    "extrapolation_floor_applied",
+    "n_channels_floored",
     "prob_below_breakeven",
 )
 
@@ -218,6 +222,9 @@ class SweepInputs:
     theta: np.ndarray | None
     reference_spend: float = REFERENCE_SPEND
     saturate_std_cpc: bool = False
+    # (k,) per-channel lower bound on the CPC curve's INPUT. None reproduces
+    # the unbounded Phase 4 behaviour exactly; see saturation.apply_spend_floor.
+    spend_floor: np.ndarray | None = None
     total_budget: float = TOTAL_BUDGET
     n_paths: int = 10_000
 
@@ -233,6 +240,21 @@ class SweepInputs:
             raise ValueError(f"correlation has shape {np.shape(self.correlation)}, expected {(k, k)}")
         if self.theta is not None and np.asarray(self.theta).shape != (k,):
             raise ValueError(f"theta has shape {np.shape(self.theta)}, expected {(k,)}")
+        if self.spend_floor is not None and np.asarray(self.spend_floor).shape != (k,):
+            raise ValueError(
+                f"spend_floor has shape {np.shape(self.spend_floor)}, expected {(k,)}"
+            )
+        if self.spend_floor is not None:
+            fl = np.asarray(self.spend_floor, dtype=float)
+            # A zero / negative / non-finite floor is not "no floor", it is the
+            # unbounded extrapolation this whole mechanism exists to stop --
+            # silently, because apply_spend_floor would just produce an
+            # all-False mask. Pass spend_floor=None to mean "no floor".
+            if not np.all(np.isfinite(fl)) or np.any(fl <= 0.0):
+                raise ValueError(
+                    f"spend_floor must be finite and > 0 elementwise, got {fl.tolist()}; "
+                    f"pass spend_floor=None if you intend no floor at all"
+                )
         if self.n_paths <= 0:
             raise ValueError(f"n_paths must be > 0, got {self.n_paths}")
 
@@ -696,12 +718,23 @@ def summarize_cell(
         theta=inputs.theta,
         reference_spend=inputs.reference_spend,
         saturate_std_cpc=inputs.saturate_std_cpc,
+        spend_floor=inputs.spend_floor,
     )
     revenue = df["total_simulated_revenue"].to_numpy(dtype=float)
     total_spend = float(df["total_spend"].iloc[0])
-    return summarize_revenue(
+    row = summarize_revenue(
         allocation_id, scenario_id, revenue, total_spend, int(seed), var_confidence
     )
+    # Whether this allocation was priced at the edge of the evidence. Computed
+    # from the allocation and the floor directly rather than read back out of
+    # the engine, so it is well defined even when saturation is off.
+    _, floored = saturation.apply_spend_floor(
+        np.array([allocation[c] for c in inputs.channels], dtype=float),
+        inputs.spend_floor,
+    )
+    row["extrapolation_floor_applied"] = bool(floored.any())
+    row["n_channels_floored"] = int(floored.sum())
+    return row
 
 
 def summarize_revenue(
@@ -1091,8 +1124,13 @@ def analytic_expected_revenue_weights(
 
     if inputs.theta is not None:
         th = np.asarray(inputs.theta, dtype=float)
+        # Evaluate the curve at the FLOORED spend, exactly as the engine does.
+        # Without this the analytic check silently disagrees with the
+        # simulation for every clipped allocation -- measured at +0.41% mean
+        # on the clipped group, which is precisely the group under scrutiny.
+        curve_spend, _floored = saturation.apply_spend_floor(spend, inputs.spend_floor)
         with np.errstate(divide="ignore", invalid="ignore"):
-            mult = np.where(spend > 0.0, (spend / inputs.reference_spend) ** th, 0.0)
+            mult = np.where(spend > 0.0, (curve_spend / inputs.reference_spend) ** th, 0.0)
         if clip_subsidy:
             mult = np.maximum(mult, 1.0)
         eff_mean_cpc = np.where(spend > 0.0, mean_cpc * mult, np.inf)
@@ -1219,6 +1257,14 @@ def analytic_interior_optimum(
         "weights": {c: float(w) for c, w in zip(inputs.channels, weights)},
         "spend": {c: float(s) for c, s in zip(inputs.channels, spend)},
         "expected_revenue": analytic_expected_revenue_weights(weights, inputs, scenario),
+        # The first-order condition below solves the UNBOUNDED power law. If any
+        # funded channel lands under its floor the true curve is flat there and
+        # this optimum is not the real one -- reported, never silently returned.
+        "below_floor": (
+            [] if inputs.spend_floor is None else
+            [c for i, c in enumerate(inputs.channels)
+             if 0.0 < weights[i] * inputs.total_budget < float(inputs.spend_floor[i])]
+        ),
         "marginal_roas": {
             c: float(a[i] * (1.0 - th[i]) * spend[i] ** (-th[i]))
             for i, c in enumerate(inputs.channels)
@@ -1226,31 +1272,41 @@ def analytic_interior_optimum(
     }
 
 
-def marginal_roas(weights: np.ndarray, inputs: SweepInputs, scenario: Scenario) -> dict[str, float]:
+def marginal_roas(weights: np.ndarray, inputs: SweepInputs, scenario: Scenario,
+                  eps: float = 1.0) -> dict[str, float]:
     """d E[revenue] / d spend, per channel, at a given allocation.
 
     Under saturation this varies across allocations; under the linear Phase 2/3
-    model it is a constant, which is exactly why that model always answered
-    "put everything in the best channel". At the interior optimum every FUNDED
+    model it is a constant, which is exactly why that model always answered "put
+    everything in the best channel". At the interior optimum every FUNDED
     channel's marginal is equal -- that equality is the optimality condition and
     is a good check on the search.
+
+    CENTRAL DIFFERENCE on `analytic_expected_revenue_weights`, not a closed form.
+    The closed form `A_i (1-theta_i) s^-theta_i` is only correct ABOVE the spend
+    floor: below it the curve is pinned at the floor, so effective CPC is
+    constant, revenue is LINEAR in spend, and the marginal is `A_i * floor^-theta`
+    -- a different expression entirely. Differencing the revenue function means
+    there is exactly one place the pricing rule lives, and this cannot drift away
+    from it the way the closed form did.
+
+    `eps` is in DOLLARS and the step is taken on spend, holding the other
+    channels fixed (so the total budget moves by eps; this is a partial
+    derivative, not a reallocation).
     """
     w = np.asarray(weights, dtype=float)
     spend = w * inputs.total_budget
-    mean_cpc = np.asarray(inputs.mean_cpc, dtype=float) * scenario.cpc_multiplier
-    std_cpc = np.asarray(inputs.std_cpc, dtype=float) * scenario.cpc_multiplier
-    mean_cvr = np.asarray(inputs.mean_cvr, dtype=float) * scenario.cvr_multiplier
-    mean_rpc = np.asarray(inputs.mean_rpc, dtype=float) * scenario.revenue_multiplier
-    th = (np.zeros(inputs.k) if inputs.theta is None
-          else np.asarray(inputs.theta, dtype=float))
-
-    a = (inputs.reference_spend ** th) / mean_cpc * mean_cvr * mean_rpc
-    a = a * np.exp(np.log1p((std_cpc / mean_cpc) ** 2))
-    out = {}
+    out: dict[str, float] = {}
     for i, c in enumerate(inputs.channels):
-        out[c] = float("nan") if spend[i] <= 0.0 else float(
-            a[i] * (1.0 - th[i]) * spend[i] ** (-th[i])
-        )
+        if spend[i] <= 0.0:
+            out[c] = float("nan")
+            continue
+        lo = spend.copy(); hi = spend.copy()
+        step = min(eps, spend[i] / 2.0)
+        lo[i] -= step; hi[i] += step
+        r_lo = analytic_expected_revenue_weights(lo / inputs.total_budget, inputs, scenario)
+        r_hi = analytic_expected_revenue_weights(hi / inputs.total_budget, inputs, scenario)
+        out[c] = float((r_hi - r_lo) / (2.0 * step))
     return out
 
 

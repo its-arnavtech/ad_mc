@@ -280,6 +280,7 @@ def simulate_cell(
     theta=None,
     reference_spend: float = REFERENCE_SPEND,
     saturate_std_cpc: bool = False,
+    spend_floor=None,
 ) -> pd.DataFrame:
     """Run one (allocation, scenario) cell and return one row per path.
 
@@ -335,6 +336,7 @@ def simulate_cell(
         theta=theta,
         reference_spend=reference_spend,
         saturate_std_cpc=saturate_std_cpc,
+        spend_floor=spend_floor,
     )
 
     total_spend = float(result.allocation.sum())
@@ -363,6 +365,7 @@ def simulate_cell_from_scenario(
     theta=None,
     reference_spend: float = REFERENCE_SPEND,
     saturate_std_cpc: bool = False,
+    spend_floor=None,
 ) -> pd.DataFrame:
     """Convenience wrapper taking a `scenarios.Scenario` instead of loose floats.
 
@@ -387,4 +390,5 @@ def simulate_cell_from_scenario(
         theta=theta,
         reference_spend=reference_spend,
         saturate_std_cpc=saturate_std_cpc,
+        spend_floor=spend_floor,
     )

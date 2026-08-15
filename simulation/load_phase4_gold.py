@@ -131,7 +131,30 @@ def build_inputs(w, wid) -> tuple[F.SweepInputs, list[str]]:
         std_rpc=a["std_revenue_per_conversion"].to_numpy(),
         correlation=DA.load_correlation_matrix(w, wid, ch, "cvr"),
         theta=SAT.theta_vector(ch, dict(SAT.DEFAULT_THETA)),
+        spend_floor=SAT.spend_floor_vector(ch),
     ), ch
+
+
+def assert_floor_snapshot_matches_live(w, wid) -> dict[str, float]:
+    """Re-derive the spend floors from live bronze and check the frozen copy.
+
+    The floors are frozen in `saturation.py` so they are available without a
+    warehouse round trip, which means they can silently go stale if bronze is
+    ever reloaded. This is the call that stops that -- it exists because the
+    guard shipped uncalled the first time, which made the comment claiming it
+    're-validates' the snapshot untrue of any code path.
+    """
+    q = float(SAT.BRONZE_SPEND_FLOOR_PERCENTILE)
+    _c, rows = sql(w, wid, f"""
+        SELECT channel_id, PERCENTILE(spend, {q}) AS p
+        FROM ad_mc_poc.bronze.channel_performance_history
+        GROUP BY channel_id
+    """)
+    live = {r[0]: float(r[1]) for r in rows}
+    diffs = SAT.check_spend_floor_snapshot(live)
+    print(f"  spend-floor snapshot vs live bronze: max rel {max(diffs.values()):.2e} "
+          f"(frozen values are the live p5 rounded to the dollar)")
+    return diffs
 
 
 def run_two_stage(inputs: F.SweepInputs, ch: list[str]):
@@ -172,6 +195,7 @@ def main() -> None:
     w = get_client()
     wid = resolve_warehouse_id(w)
     inputs, ch = build_inputs(w, wid)
+    assert_floor_snapshot_matches_live(w, wid)
 
     if args.load_only and CACHE.exists():
         with CACHE.open("rb") as fh:
@@ -188,6 +212,20 @@ def main() -> None:
     df = df.copy()
     df["stage"] = df["allocation_id"].map(lambda a: meta[a].stage)
     df["family"] = df["allocation_id"].map(lambda a: meta[a].family)
+
+    # The extrapolation flag is a pure function of (allocation, floor), so it is
+    # recomputed here from the candidate set rather than trusted to have
+    # survived the sweep's fixed output schema. That also means a cached sweep
+    # from before the flag existed still loads correctly.
+    floors = inputs.spend_floor
+    floored_n = {}
+    for cand in candidates:
+        _, mask = SAT.apply_spend_floor(
+            np.array(cand.spend, dtype=float), floors
+        )
+        floored_n[cand.allocation_id] = int(mask.sum())
+    df["n_channels_floored"] = df["allocation_id"].map(floored_n)
+    df["extrapolation_floor_applied"] = df["n_channels_floored"] > 0
     df["seed"] = df["seed"].map(str)   # unsigned 64-bit does not fit a BIGINT
 
     print(f"\ntotal: {len(candidates)} candidates, {len(df)} cells, "
@@ -197,7 +235,7 @@ def main() -> None:
     sweep_cols = ["allocation_id", "scenario_id", "stage", "family", "n_paths", "seed",
                   "total_spend", "mean_revenue", "se_mean_revenue", "std_revenue",
                   "median_revenue", "min_revenue", "max_revenue", "var_95", "cvar_95",
-                  "expected_roas"]
+                  "expected_roas", "extrapolation_floor_applied", "n_channels_floored"]
     print(f"\nwriting {TBL_SWEEP}")
     insert_rows(w, wid, TBL_SWEEP, sweep_cols, df[sweep_cols].to_dict("records"))
 
@@ -215,11 +253,13 @@ def main() -> None:
                     "mean_revenue": row["mean_revenue"], "std_revenue": row["std_revenue"],
                     "var_95": row["var_95"], "cvar_95": row["cvar_95"],
                     "expected_roas": row["expected_roas"], "rank_by_return": rank,
+                    "extrapolation_floor_applied": bool(row["extrapolation_floor_applied"]),
                 })
     print(f"\nwriting {TBL_FRONTIER} ({len(frontier_rows)} rows)")
     insert_rows(w, wid, TBL_FRONTIER,
                 ["scenario_id", "objective_pair", "allocation_id", "mean_revenue",
-                 "std_revenue", "var_95", "cvar_95", "expected_roas", "rank_by_return"],
+                 "std_revenue", "var_95", "cvar_95", "expected_roas", "rank_by_return",
+                 "extrapolation_floor_applied"],
                 frontier_rows)
 
     # ---- gold 3: recommendations -------------------------------------------
@@ -230,7 +270,7 @@ def main() -> None:
     rec_cols = ["scenario_id", "objective_pair", "recommendation", "allocation_id",
                 "mean_revenue", "std_revenue", "var_95", "cvar_95", "expected_roas",
                 "n_efficient", "balanced_is_degenerate", "nearest_neighbour_gap",
-                "ordering_unresolved"]
+                "ordering_unresolved", "extrapolation_floor_applied"]
     print(f"\nwriting {TBL_RECS} ({len(recs)} rows)")
     insert_rows(w, wid, TBL_RECS, rec_cols, recs[rec_cols].to_dict("records"))
 
@@ -253,6 +293,14 @@ def main() -> None:
                         f"ON f.allocation_id = s.allocation_id AND f.scenario_id = s.scenario_id "
                         f"WHERE s.allocation_id IS NULL")
     check("every frontier row references a real sweep row", int(r[0][0]) == 0, f"{r[0][0]} orphans")
+    _c, r = sql(w, wid, f"SELECT COUNT(*) FROM {TBL_SWEEP} WHERE "
+                        f"extrapolation_floor_applied IS NULL OR n_channels_floored IS NULL")
+    check("the extrapolation flag is populated on every sweep row",
+          int(r[0][0]) == 0, f"{r[0][0]} null rows")
+    _c, r = sql(w, wid, f"SELECT COUNT(*) FROM {TBL_SWEEP} WHERE "
+                        f"(n_channels_floored > 0) <> extrapolation_floor_applied")
+    check("the flag agrees with the channel count it summarises",
+          int(r[0][0]) == 0, f"{r[0][0]} inconsistent rows")
     _c, r = sql(w, wid, f"SELECT objective_pair, COUNT(*) FROM {TBL_RECS} GROUP BY objective_pair")
     check("3 recommendations x 4 scenarios for each of 3 objective pairs",
           all(int(x[1]) == 12 for x in r) and len(r) == 3, str([(x[0], x[1]) for x in r]))
