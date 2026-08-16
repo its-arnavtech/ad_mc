@@ -665,6 +665,28 @@ Structured to demonstrate three roles in one system:
   "unconfirmed" rather than "refuted". Either way the ordering story is not
   currently supported by data, and Phase 6 must not present theta as measured.
 
+- **Phase 5 (Orchestration & Tracking):** IN PROGRESS on branch
+  `phase-5-orchestration` (branched off `phase-4-spend-floor` at `a289016`).
+  Wires the ALREADY-VALIDATED pipeline into a persisted Databricks Workflow and
+  instruments it with MLflow. NO modeling changes: simulation math, theta, the
+  spend floor and the CRN scheme are untouched, and the open theta-vs-bronze
+  question stays open for Phase 6.
+
+  **Two structural facts that shape the DAG, from inventorying the repo:**
+  1. The Phase 4 sweep runs LOCALLY today (`load_phase4_gold.py`, single
+     threaded, writing to gold over the SQL API). A Workflow task runs ON
+     Databricks, so the sweep has to move there. Phase 3 already built the
+     machinery for exactly that — a wheel built from the repo's own modules,
+     named in a serverless environment spec — so Phase 5 reuses it rather than
+     inventing a second mechanism.
+  2. The search is ADAPTIVE, so this cannot be one flat parallel job: stage 2
+     refines around stage 1's computed Pareto union. That forces a real
+     dependency edge, and it forces intermediate state to cross a task
+     boundary (separate processes), which a UC volume carries.
+
+  Phase 5 also needs a PERSISTED job definition, which is the first time this
+  project creates one — Phases 3 and 4 deliberately used transient
+  `jobs.submit` runs to stay inside the "no Workflows before Phase 5" rule.
 - **Later:** Phase 5 (Workflows +
   MLflow orchestration), Phase 6 (analysis & reporting).
 
