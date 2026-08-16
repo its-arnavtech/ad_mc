@@ -228,16 +228,26 @@ def money(x) -> str:
 # 1. Build the wheel
 # =============================================================================
 
-def build_wheel() -> tuple[str, bytes]:
+def build_wheel(modules: list[str] | None = None,
+                required: tuple[str, ...] | None = None) -> tuple[str, bytes]:
     """Package the frozen simulation modules as `ad_mc_sim`. Returns (filename, bytes).
 
     Hand-assembled rather than shelled out to setuptools/build so it has no
     build-time dependency and produces byte-identical output for identical
     inputs -- which is what makes the content-hashed version meaningful.
+
+    `modules` / `required` default to this module's Phase 3 lists, so calling
+    `build_wheel()` with no arguments produces exactly the wheel Phase 3 and
+    Phase 4 shipped. Phase 5 passes a LONGER list (it needs frontier.py and
+    sweep_seeding.py on the executors, which the Phase 3 sweep never did) rather
+    than owning a second wheel builder -- the content hash then differs, which
+    is the provenance mechanism working, not a problem.
     """
+    modules = list(PACKAGE_MODULES if modules is None else modules)
+    required = tuple(REQUIRED_IN_WHEEL if required is None else required)
     src_dir = REPO_ROOT / "simulation"
     sources = {}
-    for name in PACKAGE_MODULES:
+    for name in modules:
         path = src_dir / name
         if not path.exists():
             raise SystemExit(f"ERROR: {path} does not exist; cannot build the wheel")
@@ -308,18 +318,18 @@ def build_wheel() -> tuple[str, bytes]:
     # missing module and a ModuleNotFoundError raised inside a Spark task.
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         names = set(zf.namelist())
-        for required in REQUIRED_IN_WHEEL:
-            arc = f"{PACKAGE_NAME}/{required}"
+        for name in required:
+            arc = f"{PACKAGE_NAME}/{name}"
             if arc not in names:
                 raise SystemExit(f"ERROR: wheel is missing {arc}; add it to PACKAGE_MODULES")
-            if zf.read(arc) != (src_dir / required).read_bytes():
-                raise SystemExit(f"ERROR: {arc} in the wheel differs from {src_dir / required}")
+            if zf.read(arc) != (src_dir / name).read_bytes():
+                raise SystemExit(f"ERROR: {arc} in the wheel differs from {src_dir / name}")
 
     print(f"  built {filename} ({len(data):,} bytes)")
     print(f"    modules: {sorted(sources)}")
     print(f"    content sha256[:12] = {content_hash}")
     print(f"    verified present and byte-identical in the archive: "
-          f"{', '.join(REQUIRED_IN_WHEEL)}")
+          f"{', '.join(required)}")
     return filename, data
 
 
@@ -350,15 +360,19 @@ def upload_wheel(w, filename: str, data: bytes) -> str:
     return path
 
 
-def upload_notebook(w, user: str) -> str:
+def upload_notebook(w, user: str, source: Path | None = None,
+                    base_name: str = "_ad_mc_phase3_distributed") -> str:
     """Upload the source notebook. Note the .py suffix -- it is load-bearing.
 
     `workspace.upload` with format=SOURCE lands the object at `<path>.py`, and
     `notebook_task.notebook_path` must then include that `.py`. Passing the
     extensionless path gives 'Unable to access the notebook'.
+
+    `source` / `base_name` default to Phase 3's single notebook. Phase 5 has five
+    task notebooks and reuses this rather than re-deriving the `.py` rule.
     """
-    base = f"/Users/{user}/_ad_mc_phase3_distributed"
-    src = NOTEBOOK_SOURCE.read_bytes()
+    base = f"/Users/{user}/{base_name}"
+    src = (NOTEBOOK_SOURCE if source is None else Path(source)).read_bytes()
     w.workspace.upload(base + ".py", io.BytesIO(src), format=ImportFormat.SOURCE,
                        language=Language.PYTHON, overwrite=True)
     print(f"  uploaded notebook -> {base}.py ({len(src):,} bytes)")

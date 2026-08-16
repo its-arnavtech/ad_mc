@@ -687,6 +687,168 @@ Structured to demonstrate three roles in one system:
   Phase 5 also needs a PERSISTED job definition, which is the first time this
   project creates one — Phases 3 and 4 deliberately used transient
   `jobs.submit` runs to stay inside the "no Workflows before Phase 5" rule.
+
+  **DEPLOYED AND RUN. Job `94493651519110`** ("ad_mc_poc -- frontier pipeline
+  (Phase 5)"), 5 tasks, serverless job compute. Runs: `529952200505846` FAILED,
+  then `407499289143226` and `322037088744573` both SUCCESS in ~240s.
+  DAG: `bronze_refresh -> stage1_simulate -> stage2_generate -> stage2_simulate`,
+  with `gold_aggregate` fanning in from BOTH `stage1_simulate` and
+  `stage2_simulate` (it merges the two stages). Stage-1 sweep 41.6s for 2,284
+  cells, stage 2 33.5s for 1,600 — against 292s single-threaded locally in
+  Phase 4, so `applyInPandas` chunking (~32 cells per chunk, 72/50 chunks) is
+  doing real work here.
+
+  **Run 1's failure is worth keeping.** `TypeError: Object of type PlanMetrics
+  is not JSON serializable`, thrown by `pdf.to_parquet()` AFTER all 22.8M paths
+  had been simulated. `DataFrame.attrs` is written into parquet key-value
+  metadata as JSON, and Databricks attaches a `PlanMetrics` object to every
+  frame `toPandas()` returns. Fixed by clearing `attrs` on a copy before write.
+
+  **Parameters** — 7 job parameters, defaults exactly the `a289016` values,
+  threaded job parameter -> task `base_parameters` (`{{job.parameters.*}}`) ->
+  notebook widget -> `resolve_params()` -> typed config. Widget defaults are
+  EMPTY on purpose: `resolve_params` raises on an empty or still-templated
+  value, so a parameter that fails to resolve fails the task instead of
+  silently falling back to a notebook-local default.
+  `total_budget` 500000.0 / `master_seed` 20260808 / `n_paths` 10000 /
+  `stage1_dirichlet_total` 450 / `stage2_cap` 400 / `catalog` / `mlflow_experiment`.
+  **Naming departure, deliberate:** there is no `stage1_candidates` parameter.
+  Stage 1 is 21 Phase 3 + 1 centroid + fixed {5,3} and {5,4} lattices (35 + 70)
+  + three Dirichlet blocks; only the last is a real knob, so a parameter called
+  `stage1_candidates` would name something it cannot set. `stage1_dirichlet_total`
+  is apportioned by largest remainder and at 450 returns exactly
+  `((1.0,225),(0.3,125),(4.0,100))`, reproducing all 571 stage-1 candidates with
+  ids, families and spend tuples equal under exact float `==`.
+
+  **Three refactors, all reported, none touching modeling.** `git diff` shows
+  `engine.py`, `saturation.py`, `cell.py`, `seeding.py`, `sweep_seeding.py`,
+  `scenarios.py`, `frontier.py`, `allocations.py`, `config.py` byte-unchanged.
+  1. `run_phase3_distributed.build_wheel()` gained `modules`/`required` kwargs
+     and `upload_notebook()` gained `source`/`base_name` — NECESSARY because
+     Phase 5 needs `frontier.py` + `sweep_seeding.py` on executors and five
+     notebooks, and a second wheel builder would be the wrong answer. The
+     builder's default-output equality with HEAD was self-reported and has NOT
+     been independently re-verified; what has been verified is the deployed
+     wheel's CONTENTS (below).
+  2. `simulation/gold_assembly.py` (new), with `load_phase4_gold.py` delegating
+     to it — NECESSARY because the Workflow must build identical gold in a
+     different process and two copies would drift. Rebuilding all three frames
+     from the Phase 4 cache matches live gold bitwise on every value.
+  3. `simulation/bronze_sql.py` (new), with `03_build_assumptions.py` importing
+     it — NECESSARY so `bronze_refresh` runs the SAME SQL via `spark.sql`
+     rather than a retyped copy. All three statements byte-identical to HEAD's.
+  Plus one addition beyond the brief: `gold_assembly.canonical_cell_order`,
+  because Spark returns cells in task-completion order while the frontier
+  helpers break exact ties by row position.
+
+  **MLflow** — experiment `/Users/its.arnavk.here@gmail.com/ad_mc_poc`
+  (id `1983482982160806`), ONE run per Workflow run, created in `bronze_refresh`
+  and passed forward via `dbutils.jobs.taskValues`, resumed by later tasks.
+  Run `376e1a6f3ad74f1082e8b7df763bc55c`: 36 params, 51 metrics, FINISHED.
+  theta and spend_floor logged PER CHANNEL from `saturation` (0.12/0.352/0.225/
+  0.167/0.259 and 311/2755/834/552/1300), 12 `frontier_size__*` metrics,
+  `total_paths_simulated` 38,840,000, `stage1_pareto_union` 51, flag counts AND
+  percentages, `wall_clock_s__*` for all five tasks, and three real artifacts
+  (two frontier PNGs, `frontier_recommendations.csv` 36 x 14 carrying both flags).
+
+  **REPRODUCTION vs `a289016`: every DECISION identical, values drift 1-2 ulp.**
+  Reference captured before the run and re-recovered via Delta time travel
+  (sweep v78 / frontier v14 / recs v8).
+  - Identical: 3,884 / 519 / 36 rows; every `allocation_id`, `scenario_id`,
+    `family`, `objective_pair`, `recommendation`, `seed`; `rank_by_return`
+    519/519; **all three boolean flags, 0 mismatches** (692 / 50 / 16 floored,
+    11 of 36 `ordering_unresolved`); frontier and recommendation key sets;
+    `stage1_pareto_union` 51; and best-normal `dir1_110` at
+    1054690.6952344836 — bitwise equal.
+  - Different: 3,880 of 3,884 rows differ in at least one float, largest
+    absolute difference anywhere **$8.4e-09**.
+  - The split is the mechanism, not noise: AVERAGING columns are bitwise on
+    ~63-67% of rows (mean_revenue 64.9%, max rel 5.2e-16) while ORDER
+    STATISTICS are bitwise on only ~25-32% (var_95 24.8%, max rel 2.4e-15).
+    Averaging cancels ~1e-15 path drift; a percentile cannot.
+  - Cause is the ENVIRONMENT, not the Phase 5 code path. 12 live cells
+    re-simulated locally at their CRN seeds match the `a289016` reference
+    **60/60 bitwise** — the reference was produced by this interpreter — while
+    matching the cluster's gold on only **25 of 60** (an earlier draft said
+    30/60; that figure is not reproducible and the exact count depends on
+    which cells you sample, so quote the structure, not the number).
+    **THE VERSION ATTRIBUTION WAS TESTED, NOT ASSUMED — and unlike Phase 3 and
+    Phase 4, it SURVIVES the test.** Two LOCAL environments differing only in
+    package versions (py3.13.14 / numpy 2.5.1 / scipy 1.18.0 versus
+    py3.12.13 / numpy 1.26.4 / scipy 1.17.1) disagree on **10 of 60** values
+    on the same machine, same code, same seeds. So package versions
+    demonstrably do move these numbers. That is the exact test the earlier two
+    causal claims FAILED (three environments there gave bitwise-identical
+    aggregates, which is what disproved them). Executors are py3.12.3 /
+    numpy 2.1.3 / scipy 1.15.1. Still **no specific special function is named
+    as the mechanism** — that remains untested.
+  - Determinism: runs 2 and 3 are bitwise identical on all three tables
+    (54,376 / 3,114 / 252 float values), and the four intermediate parquet
+    files are sha256-identical between runs.
+
+  **THIS REFINES A PHASE 3 CLAIM.** Phase 3 states aggregates are "bitwise
+  identical across environments" — that was measured on ONE anchor cell.
+  Across 3,884 cells `mean_revenue` is bitwise identical on only 64.9%; the
+  rest differ by <= 2 ulp. The Phase 3 statement is true of its sample, not of
+  the population. Do not generalise it.
+
+  **VERIFICATION (2026-08-16), recomputed against live Databricks.** The
+  independent pass was cut short by an account limit, so the remaining items
+  were re-derived directly rather than re-read. PASS: the drift table
+  reproduces exactly (3,880 of 3,884 rows differ; averaging columns bitwise on
+  63.3-67.4%, order statistics on 24.8-32.2%; max abs anywhere 8.382e-09);
+  decisions are 100% identical to the reference (0 mismatches on flags, seeds,
+  family/stage, frontier key sets, ranks, and all 36 recommendation picks);
+  runs 2 and 3 are bitwise deterministic (0 rows differing, max abs 0.0,
+  `EXCEPT` empty both directions); all gold column comments survived
+  `INSERT OVERWRITE`; the three job-compute bronze rebuilds are identical, and
+  `gold_assembly` rebuilds the reference at **19,420 / 19,420 floats bitwise**;
+  stage 1 reproduces 571 and stage 2 reproduces 400 under exact float `==`
+  with a Pareto union of 51.
+
+  **WHEEL: "byte-identical" was IMPRECISE.** All 12 modules in the deployed
+  wheel match `b2e76e5`, but four (`cell.py`, `engine.py`, `frontier.py`,
+  `saturation.py`) are NOT raw-byte identical — each differs by exactly its
+  line count, because the wheel is built from the CRLF working tree while
+  `git show` emits LF. All four are **AST-identical**. State it as "identical
+  after line-ending normalisation", not "byte-identical".
+
+  Not independently re-verified: `build_wheel()`'s default-output equality, and
+  `bronze_sql`'s statements as STRINGS (their OUTPUT is verified identical, via
+  the three matching bronze rebuilds and a local re-simulation from live
+  post-refresh bronze that reproduces the reference 60/60 bitwise — which is
+  impossible if the refresh had altered bronze).
+
+  **Two gaps, both flagged rather than papered over:**
+  1. ~~A FAILED task leaves its MLflow run in status RUNNING forever.~~
+     **CLOSED.** This was not merely untidy: the stuck run carried 9 metrics
+     and ALL 9 keys overlap the ones a successful run logs (`bronze__*`,
+     `wall_clock_s__bronze_refresh`), so any aggregate over the experiment that
+     did not filter on status silently mixed a partial run into the numbers.
+     Run 1's `60fb32bb3c1e4b019e72ccd9a5bfe6c2` has been terminated as FAILED
+     (the experiment now reads FAILED / FINISHED / FINISHED, zero RUNNING), and
+     `phase5_tasks.mark_run_failed` plus a `try/except BaseException` in all
+     five notebooks makes it self-healing. `mark_run_failed` swallows its own
+     errors on purpose — it runs inside an exception handler, and masking the
+     real failure with a bookkeeping error would be strictly worse.
+     **The safeguard was PROVEN, not just shipped:** a throwaway MLflow run was
+     created in RUNNING, a probe notebook failed exactly as a guarded task
+     would, the task failed as intended (the re-raise is preserved) and the run
+     ended **FAILED**. The throwaway run was then deleted.
+  2. `load_phase4_gold.py` was NOT executed end to end after being refactored
+     to delegate to `gold_assembly`, because doing so would overwrite the
+     Workflow's gold. Its frame building is proven bitwise-identical in
+     process and its column lists proven `==` to the originals, but the script
+     itself has not been run since the change. Left as-is deliberately: the
+     verifier's recommendation, and the risk is now small because the delegated
+     logic is proven to rebuild the reference at 19,420/19,420 floats bitwise —
+     what remains unexercised is only the script's own orchestration, which is
+     otherwise unchanged from `a289016`.
+  Also: `gold_aggregate` asserts the gold tables exist rather than creating
+  them, so DDL stays owned by `08_create_gold_frontier.py` and its column
+  comments are never rewritten. On a fresh workspace that script runs first.
+  `spark.sql.adaptive.coalescePartitions.enabled` is REFUSED on serverless
+  (`CONFIG_NOT_AVAILABLE`); `shuffle.partitions` is accepted.
 - **Later:** Phase 5 (Workflows +
   MLflow orchestration), Phase 6 (analysis & reporting).
 

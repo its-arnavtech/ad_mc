@@ -52,7 +52,13 @@ Assumptions baked in here -- change them in one place if you disagree:
     python databricks/03_build_assumptions.py
 """
 
-from _common import (
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "simulation"))
+
+from _common import (  # noqa: E402
     TBL_ASSUMPTIONS,
     TBL_CORRELATION,
     TBL_CVR_CORRELATION,
@@ -63,7 +69,15 @@ from _common import (
     sql,
 )
 
-SKEW_THRESHOLD = 0.5
+# The three statements below moved to simulation/bronze_sql.py VERBATIM so the
+# Phase 5 `bronze_refresh` Workflow task can run the same text through spark.sql
+# instead of keeping a second copy. See that module's docstring.
+from bronze_sql import (  # noqa: E402
+    SKEW_THRESHOLD,
+    assumptions_statement,
+    cvr_correlation_statement,
+    revenue_correlation_statement,
+)
 
 
 def main() -> None:
@@ -72,65 +86,13 @@ def main() -> None:
 
     # ---- channel_assumptions ------------------------------------------------
     print(f"== Building {TBL_ASSUMPTIONS} ==")
-    sql(
-        w,
-        warehouse_id,
-        f"""
-        CREATE OR REPLACE TABLE {TBL_ASSUMPTIONS}
-        COMMENT 'Bronze: per-channel distribution parameters derived from channel_performance_history.'
-        AS
-        WITH daily AS (
-            SELECT
-                channel_id,
-                CASE WHEN impressions > 0 THEN clicks      / impressions END AS ctr,
-                CASE WHEN clicks      > 0 THEN spend       / clicks      END AS cpc,
-                CASE WHEN clicks      > 0 THEN conversions / clicks      END AS cvr,
-                CASE WHEN conversions > 0 THEN revenue     / conversions END AS revenue_per_conversion
-            FROM {TBL_HISTORY}
-        )
-        SELECT
-            channel_id,
-            INITCAP(REPLACE(channel_id, '_', ' '))          AS channel_name,
-            AVG(ctr)                                        AS mean_ctr,
-            STDDEV_SAMP(ctr)                                AS std_ctr,
-            AVG(cpc)                                        AS mean_cpc,
-            STDDEV_SAMP(cpc)                                AS std_cpc,
-            AVG(cvr)                                        AS mean_cvr,
-            STDDEV_SAMP(cvr)                                AS std_cvr,
-            AVG(revenue_per_conversion)                     AS mean_revenue_per_conversion,
-            STDDEV_SAMP(revenue_per_conversion)             AS std_revenue_per_conversion,
-            CASE
-                WHEN SKEWNESS(revenue_per_conversion) > {SKEW_THRESHOLD} THEN 'lognormal'
-                ELSE 'normal'
-            END                                             AS distribution_type
-        FROM daily
-        GROUP BY channel_id
-        ORDER BY channel_id
-        """,
-    )
+    sql(w, warehouse_id, assumptions_statement(TBL_ASSUMPTIONS, TBL_HISTORY, SKEW_THRESHOLD))
     cols, rows = sql(w, warehouse_id, f"SELECT * FROM {TBL_ASSUMPTIONS} ORDER BY channel_id")
     print_table(cols, rows)
 
     # ---- channel_correlation_matrix ----------------------------------------
     print(f"\n== Building {TBL_CORRELATION} ==")
-    sql(
-        w,
-        warehouse_id,
-        f"""
-        CREATE OR REPLACE TABLE {TBL_CORRELATION}
-        COMMENT 'Bronze: Pearson correlation of daily revenue between every channel pair, full history window.'
-        AS
-        SELECT
-            a.channel_id            AS channel_id_a,
-            b.channel_id            AS channel_id_b,
-            CORR(a.revenue, b.revenue) AS correlation_coefficient
-        FROM {TBL_HISTORY} a
-        JOIN {TBL_HISTORY} b
-          ON a.date = b.date
-        GROUP BY a.channel_id, b.channel_id
-        ORDER BY channel_id_a, channel_id_b
-        """,
-    )
+    sql(w, warehouse_id, revenue_correlation_statement(TBL_CORRELATION, TBL_HISTORY))
     cols, rows = sql(
         w,
         warehouse_id,
@@ -147,33 +109,7 @@ def main() -> None:
     print(f"  channel-days with undefined CVR (zero/null clicks): {undefined}")
     print("  -> excluded pairwise from the correlation; not imputed")
 
-    sql(
-        w,
-        warehouse_id,
-        f"""
-        CREATE OR REPLACE TABLE {TBL_CVR_CORRELATION}
-        COMMENT 'Bronze: Pearson correlation of daily CVR (conversions/clicks) between every channel pair, full history window. Days with zero clicks are excluded pairwise. This is the matrix the Monte Carlo Cholesky step uses.'
-        AS
-        WITH daily_cvr AS (
-            SELECT
-                date,
-                channel_id,
-                CASE WHEN clicks > 0 THEN conversions / clicks END AS cvr
-            FROM {TBL_HISTORY}
-        )
-        SELECT
-            a.channel_id              AS channel_id_a,
-            b.channel_id              AS channel_id_b,
-            CORR(a.cvr, b.cvr)        AS correlation_coefficient
-        FROM daily_cvr a
-        JOIN daily_cvr b
-          ON a.date = b.date
-        WHERE a.cvr IS NOT NULL
-          AND b.cvr IS NOT NULL
-        GROUP BY a.channel_id, b.channel_id
-        ORDER BY channel_id_a, channel_id_b
-        """,
-    )
+    sql(w, warehouse_id, cvr_correlation_statement(TBL_CVR_CORRELATION, TBL_HISTORY))
 
     cols, rows = sql(
         w,

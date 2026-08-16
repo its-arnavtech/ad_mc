@@ -65,6 +65,7 @@ import pandas as pd  # noqa: E402
 
 import data_access as DA  # noqa: E402
 import frontier as F  # noqa: E402
+import gold_assembly as GA  # noqa: E402
 import saturation as SAT  # noqa: E402
 from config import TOTAL_BUDGET  # noqa: E402
 from scenarios import SCENARIOS  # noqa: E402
@@ -208,71 +209,29 @@ def main() -> None:
         with CACHE.open("wb") as fh:
             pickle.dump({"candidates": candidates, "df": df, "channels": ch}, fh)
 
-    meta = {c.allocation_id: c for c in candidates}
-    df = df.copy()
-    df["stage"] = df["allocation_id"].map(lambda a: meta[a].stage)
-    df["family"] = df["allocation_id"].map(lambda a: meta[a].family)
-
-    # The extrapolation flag is a pure function of (allocation, floor), so it is
-    # recomputed here from the candidate set rather than trusted to have
-    # survived the sweep's fixed output schema. That also means a cached sweep
-    # from before the flag existed still loads correctly.
-    floors = inputs.spend_floor
-    floored_n = {}
-    for cand in candidates:
-        _, mask = SAT.apply_spend_floor(
-            np.array(cand.spend, dtype=float), floors
-        )
-        floored_n[cand.allocation_id] = int(mask.sum())
-    df["n_channels_floored"] = df["allocation_id"].map(floored_n)
-    df["extrapolation_floor_applied"] = df["n_channels_floored"] > 0
-    df["seed"] = df["seed"].map(str)   # unsigned 64-bit does not fit a BIGINT
+    # The three frames are built by `gold_assembly`, which the Phase 5 Workflow
+    # task calls too. Same code, same column order, so the local path and the
+    # Databricks path cannot drift. `reorder=False`: `run_sweep` already emits
+    # the canonical scenario-major order here.
+    sweep, frontier_df, recs = GA.build_gold_frames(
+        df, candidates, inputs.spend_floor, reorder=False
+    )
 
     print(f"\ntotal: {len(candidates)} candidates, {len(df)} cells, "
           f"{len(df) * inputs.n_paths:,} paths")
 
     # ---- gold 1: every candidate -------------------------------------------
-    sweep_cols = ["allocation_id", "scenario_id", "stage", "family", "n_paths", "seed",
-                  "total_spend", "mean_revenue", "se_mean_revenue", "std_revenue",
-                  "median_revenue", "min_revenue", "max_revenue", "var_95", "cvar_95",
-                  "expected_roas", "extrapolation_floor_applied", "n_channels_floored"]
     print(f"\nwriting {TBL_SWEEP}")
-    insert_rows(w, wid, TBL_SWEEP, sweep_cols, df[sweep_cols].to_dict("records"))
+    insert_rows(w, wid, TBL_SWEEP, GA.SWEEP_TABLE_COLUMNS, sweep.to_dict("records"))
 
     # ---- gold 2: the frontier ----------------------------------------------
-    frontier_rows = []
-    for ret, risk, higher_better in F.OBJECTIVE_PAIRS:
-        pair = f"{ret} vs {risk}"
-        for scenario_id, sub in df.groupby("scenario_id", sort=True):
-            eff = F.frontier_for_pair(sub, ret, risk, higher_better)
-            eff = eff[eff["is_efficient"]].sort_values(ret, ascending=False)
-            for rank, (_, row) in enumerate(eff.iterrows(), start=1):
-                frontier_rows.append({
-                    "scenario_id": scenario_id, "objective_pair": pair,
-                    "allocation_id": row["allocation_id"],
-                    "mean_revenue": row["mean_revenue"], "std_revenue": row["std_revenue"],
-                    "var_95": row["var_95"], "cvar_95": row["cvar_95"],
-                    "expected_roas": row["expected_roas"], "rank_by_return": rank,
-                    "extrapolation_floor_applied": bool(row["extrapolation_floor_applied"]),
-                })
-    print(f"\nwriting {TBL_FRONTIER} ({len(frontier_rows)} rows)")
-    insert_rows(w, wid, TBL_FRONTIER,
-                ["scenario_id", "objective_pair", "allocation_id", "mean_revenue",
-                 "std_revenue", "var_95", "cvar_95", "expected_roas", "rank_by_return",
-                 "extrapolation_floor_applied"],
-                frontier_rows)
+    print(f"\nwriting {TBL_FRONTIER} ({len(frontier_df)} rows)")
+    insert_rows(w, wid, TBL_FRONTIER, GA.FRONTIER_TABLE_COLUMNS,
+                frontier_df.to_dict("records"))
 
     # ---- gold 3: recommendations -------------------------------------------
-    recs = pd.concat(
-        [F.recommend_from_frontier(df, ret, risk, hb) for ret, risk, hb in F.OBJECTIVE_PAIRS],
-        ignore_index=True,
-    )
-    rec_cols = ["scenario_id", "objective_pair", "recommendation", "allocation_id",
-                "mean_revenue", "std_revenue", "var_95", "cvar_95", "expected_roas",
-                "n_efficient", "balanced_is_degenerate", "nearest_neighbour_gap",
-                "ordering_unresolved", "extrapolation_floor_applied"]
     print(f"\nwriting {TBL_RECS} ({len(recs)} rows)")
-    insert_rows(w, wid, TBL_RECS, rec_cols, recs[rec_cols].to_dict("records"))
+    insert_rows(w, wid, TBL_RECS, GA.REC_TABLE_COLUMNS, recs.to_dict("records"))
 
     # ---- verify -------------------------------------------------------------
     print("\n== verification against the live tables ==")
