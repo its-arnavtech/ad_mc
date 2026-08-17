@@ -849,6 +849,94 @@ Structured to demonstrate three roles in one system:
   comments are never rewritten. On a fresh workspace that script runs first.
   `spark.sql.adaptive.coalescePartitions.enabled` is REFUSED on serverless
   (`CONFIG_NOT_AVAILABLE`); `shuffle.partitions` is accepted.
+- **Phase 6 (Analysis & Reporting):** on branch `phase-6-analysis-reporting`
+  (branched off `phase-5-orchestration` at `accf127`). READ-ONLY over gold —
+  nothing re-simulated. `reporting/build_report.py` queries the three gold
+  tables at render time and emits a self-contained HTML report for a budget
+  decision-maker; `reporting/report_template.py` holds the markup so numbers
+  and prose cannot drift into each other.
+
+  **ONE stated exception to "everything from gold":** the channel-level
+  breakdown needs per-channel spend and gold is at allocation grain, so
+  candidate DEFINITIONS are regenerated from `generate_stage1/2`. Those DO call
+  `rng.dirichlet`, so the accurate claim is **deterministic given the fixed
+  seed**, NOT "no RNG" — an earlier draft said the latter and it is false. No
+  Monte Carlo paths are drawn. The check is no longer id-only either: matching
+  ids are blind to the spend vectors (regenerating at a different seed gives
+  the SAME 571 ids with different spends), so it now validates against
+  `n_channels_floored`, a spend-derived fact gold already stores.
+  Per-channel revenue then uses the validated closed form. Said plainly in the
+  report's footer rather than glossed.
+
+  **LIVE GOLD DOES NOT MATCH THE FIGURES IN THE PHASE 6 BRIEF.** The brief said
+  the mean-VaR/CVaR frontiers are "6 of 971 (~0.62%)". Live gold, in
+  seasonal/normal/recession/platform order: mean-VaR **9 / 7 / 8 / 6** and
+  mean-CVaR **11 / 8 / 9 / 8**; 0.62% is only platform_algo_change. (An earlier
+  draft listed 7/6/8/9 and 8/8/9/11 against that label — right values, wrong
+  order.)
+  Mean-variance is **107-123 of 971 (11.02-12.67%)**, which does match the
+  brief's "~11-13%". The brief quoted the pre-spend-floor Phase 4 values; gold
+  now holds the Phase 5 run. The report uses the live numbers.
+
+  **Findings the report leads with, all verified against live gold:**
+  - Only the mean-VARIANCE frontier is a real curve. The thin risk-floor
+    frontiers are framed as **expected sampling behaviour** (Pareto front size
+    grows like ln(n)) and the report explicitly says this is NOT evidence of
+    collinearity, because that argument was tested and failed.
+  - **The lowest-volatility pick loses money in both adverse scenarios**:
+    `ref_dir0p3_079_c100_02` returns 0.83x under platform_algo_change and 0.90x
+    in recession, against the aggressive pick's 1.60x and 1.74x. Least variable
+    is not least likely to lose money — the report makes that its own callout.
+  - Revenue and diversification come from DIFFERENT channels. In `dir1_110`,
+    paid_search takes 47.0% of budget for 53.7% of revenue, while display is
+    the least CVR-correlated channel (0.29-0.35) and is what smooths outcomes.
+  - The floored channel makes the caveat concrete: video is funded at $1,128
+    against a $1,300 floor, and its apparent 3.62x return is an artifact of
+    being priced AT the floor.
+  - Flags surfaced inline next to the numbers, never footnoted: 11 of 36 recs
+    `ordering_unresolved`, 16 of 36 `extrapolation_floor_applied`, 0 both;
+    50 of 519 frontier rows and 692 of 3,884 sweep rows floored. Flagged
+    frontier points are drawn as outlined markers, not dropped.
+  - Limitations cover all three required items plus scenario severity: the
+    theta elasticities are ASSUMPTIONS the bronze regression does not
+    corroborate (and largely cannot, for lack of spend variation), with
+    incrementality/spend-variation testing named as what would settle it; both
+    flags explained with counts; and Spark proven but not necessary at this
+    scale (~7s single-threaded for the Phase 3 grid).
+
+  **`verifier` (2026-08-17) — PASS on every figure, PARTIAL elsewhere; all
+  findings since fixed.** It re-rendered from live gold into a scratch path and
+  got a **byte-identical** file, recomputed all 12 Pareto sets by membership
+  with its own brute force, and re-implemented the closed form from its
+  docstring (max abs diff 0.0). **Zero numeric errors** — a first for this
+  project. It also strengthened the frontier framing: a permutation test gives
+  mean-VaR 7 actual vs 7.16 permuted despite corr +0.9725, while mean-std has
+  LOWER correlation (0.7533) and a front of 109, so correlation does not drive
+  front size and the ln(n) framing is right rather than merely defensible.
+
+  It caught, and this has been fixed: (1) "orchestrated as a scheduled
+  workflow" was an OVERCLAIM — job 94493651519110 has schedule/trigger/
+  continuous all None and every run is ONE_TIME; (2) the footer disclosed the
+  closed-form revenue but NOT the reconstructed spend, while claiming
+  everything came from gold; (3) "no RNG" was false; (4) the sensitivity table
+  is the normal column times three near-uniform constants (recession factor
+  varies < 0.002 across 971), so "steadiness and safety are different things"
+  implied an allocation-specific fragility the model cannot produce — losing
+  money is determined by base-case ROAS alone, and exactly 103 of 971 fall
+  below the 1.32x threshold; (5) the diversification mechanism is not supported
+  by the correlation matrix alone, since display is ALSO the lowest-variance
+  channel on its own; (6) the theta caveat over-softened ("cannot identify an
+  elasticity at all") when every measured slope has t = 8.2-10.3 — the real
+  limit is extrapolation, the observed range sitting below 0.07x the reference;
+  (7) three of four recommendations had no channel split and were unactionable;
+  (8) the budget had no time grain stated; (9) the `ordering_unresolved` chip
+  never appeared beside a recommendation, since all four shown happened to be
+  false — a fifth pick that carries it is now displayed; (10) two totals for
+  one allocation went unreconciled (closed form vs simulated, 0.11%).
+
+  Published as a Claude artifact for viewing — NOT to Databricks; no HTML is
+  written to any UC volume, the workspace tree or MLflow. NOT MERGED — the standing rule is that
+  the merge is the user's call, and it has been put to them rather than assumed.
 - **Later:** Phase 5 (Workflows +
   MLflow orchestration), Phase 6 (analysis & reporting).
 
