@@ -858,15 +858,14 @@ Structured to demonstrate three roles in one system:
 
   **ONE stated exception to "everything from gold":** the channel-level
   breakdown needs per-channel spend and gold is at allocation grain, so
-  candidate DEFINITIONS are regenerated from `generate_stage1/2`. Those DO call
-  `rng.dirichlet`, so the accurate claim is **deterministic given the fixed
-  seed**, NOT "no RNG" — an earlier draft said the latter and it is false. No
-  Monte Carlo paths are drawn. The check is no longer id-only either: matching
-  ids are blind to the spend vectors (regenerating at a different seed gives
-  the SAME 571 ids with different spends), so it now validates against
-  `n_channels_floored`, a spend-derived fact gold already stores.
-  Per-channel revenue then uses the validated closed form. Said plainly in the
-  report's footer rather than glossed.
+  the report reads the exact stage-1/stage-2 candidate Parquets persisted by
+  the latest successful Phase 5 Workflow run. It accepts them only after their
+  971 candidate ids and persisted aggregate result metrics match live gold.
+  Both successful runs' candidate/result artifacts are byte-identical. No
+  candidate is regenerated, no RNG or simulation is called, and the report no
+  longer analytically recreates per-channel revenue. Return/risk links are
+  descriptive correlations between exact spend shares and gold's stored
+  allocation-level mean/std metrics. The footer states this boundary directly.
 
   **LIVE GOLD DOES NOT MATCH THE FIGURES IN THE PHASE 6 BRIEF.** The brief said
   the mean-VaR/CVaR frontiers are "6 of 971 (~0.62%)". Live gold, in
@@ -887,12 +886,14 @@ Structured to demonstrate three roles in one system:
     `ref_dir0p3_079_c100_02` returns 0.83x under platform_algo_change and 0.90x
     in recession, against the aggressive pick's 1.60x and 1.74x. Least variable
     is not least likely to lose money — the report makes that its own callout.
-  - Revenue and diversification come from DIFFERENT channels. In `dir1_110`,
-    paid_search takes 47.0% of budget for 53.7% of revenue, while display is
-    the least CVR-correlated channel (0.29-0.35) and is what smooths outcomes.
-  - The floored channel makes the caveat concrete: video is funded at $1,128
-    against a $1,300 floor, and its apparent 3.62x return is an artifact of
-    being priced AT the floor.
+  - Revenue-seeking and risk-reducing weights differ. In `dir1_110`, paid_search
+    takes 47.0% of budget; across all 971 candidates its share has the strongest
+    positive association with both mean revenue (+0.67) and volatility (+0.82),
+    while video share has the strongest negative volatility link (-0.79).
+    These are compositional associations, not causal channel attribution.
+  - The floored allocation makes the caveat concrete: video is funded at only
+    $1,128. The report deliberately assigns it no channel ROAS because the run
+    did not persist per-channel revenue and Phase 6 must not recompute it.
   - Flags surfaced inline next to the numbers, never footnoted: 11 of 36 recs
     `ordering_unresolved`, 16 of 36 `extrapolation_floor_applied`, 0 both;
     50 of 519 frontier rows and 692 of 3,884 sweep rows floored. Flagged
@@ -919,11 +920,11 @@ Structured to demonstrate three roles in one system:
   continuous all None and every run is ONE_TIME; (2) the footer disclosed the
   closed-form revenue but NOT the reconstructed spend, while claiming
   everything came from gold; (3) "no RNG" was false; (4) the sensitivity table
-  is the normal column times three near-uniform constants (recession factor
-  varies < 0.002 across 971), so "steadiness and safety are different things"
-  implied an allocation-specific fragility the model cannot produce — losing
-  money is determined by base-case ROAS alone, and exactly 103 of 971 fall
-  below the 1.32x threshold; (5) the diversification mechanism is not supported
+  is close to the normal column times three constants, so "steadiness and
+  safety are different things" implied an allocation-specific fragility the
+  model cannot produce — losing money is determined mainly by base-case ROAS,
+  and exactly 103 of 971 fall below the platform-change break-even threshold;
+  (5) the diversification mechanism is not supported
   by the correlation matrix alone, since display is ALSO the lowest-variance
   channel on its own; (6) the theta caveat over-softened ("cannot identify an
   elasticity at all") when every measured slope has t = 8.2-10.3 — the real
@@ -934,18 +935,39 @@ Structured to demonstrate three roles in one system:
   false — a fifth pick that carries it is now displayed; (10) two totals for
   one allocation went unreconciled (closed form vs simulated, 0.11%).
 
-  **2026-08-18 strict-completion follow-up — IN PROGRESS.** A fresh audit
+  **2026-08-18 strict-completion follow-up — VERIFIED FEASIBLE STATE; literal
+  item 4 remains blocked by the persisted schema.** A fresh audit
   against the literal Phase 6 prompt found two scope gaps despite the earlier
   numeric verifier pass: the HTML plotted only the four primary mean-variance
   views while merely describing mean-VaR and mean-CVaR, and the channel table
   quantified revenue contribution but described risk only qualitatively. The
   source now renders all 12 scenario/objective views (mean-variance remains
-  primary) and preserves both caveat types as plot outlines. It also adds a
-  per-channel risk link: correlation between reconstructed channel share and
-  the stored normal-scenario `std_revenue` across all gold candidates. This is
-  labelled descriptive, compositional and non-causal; no paths are drawn and
-  no result is re-simulated. Live re-render and the new independent verifier
-  pass are still pending before this follow-up can be called complete.
+  primary) and preserves both caveat types as plot outlines. The first fresh
+  verifier pass independently recomputed all 12 Pareto memberships with zero
+  differences and found two additional defects: the old HTML's claimed
+  recession-factor spread `<0.002` is actually 0.0104639190, and regenerated
+  candidate ids did not prove the spend vectors. The correction now derives
+  the factor range live (0.8192-0.8297), reads exact spend vectors from Phase 5
+  run 322037088744573, validates its result Parquets against live gold, removes
+  analytic per-channel revenue, and renders return/risk associations that are
+  labelled descriptive, compositional and non-causal. Live re-render succeeded
+  at 3,884 / 519 / 36 rows with 12 SVGs and reproduced byte-for-byte on a
+  second run.
+
+  The final independent verifier PASSed the engineering and every available
+  datum: exact 971 candidate / 3,884 result keys, max absolute gold-vs-Parquet
+  difference 0.0 for mean/std/VaR/CVaR/ROAS, all 12 plot counts and memberships,
+  all recommendation/sensitivity figures and flags, exact `dir1_110` spend, and
+  all five return/risk correlations. It found no candidate RNG, simulation,
+  frontier regeneration or analytic channel-revenue call in reporting.
+  It correctly leaves literal prompt compliance PARTIAL: no persisted table or
+  artifact contains per-channel revenue or component-risk output for the top
+  recommendation, and the exact spend vectors live in the verified Phase 5
+  candidate Parquets rather than the three gold tables. A true contribution
+  decomposition therefore requires either new persisted upstream output (and
+  its own verification) or permission to recompute it, which the Phase 6 prompt
+  expressly forbids. The HTML states the proxy and source boundary instead of
+  fabricating a stronger result.
 
   Published as a Claude artifact for viewing — NOT to Databricks; no HTML is
   written to any UC volume, the workspace tree or MLflow. NOT MERGED — the standing rule is that

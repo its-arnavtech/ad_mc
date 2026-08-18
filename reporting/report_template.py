@@ -188,8 +188,9 @@ def scatter(sub, front_ids, risk_col, ordering_ids=(), w=470, h=290):
             + "</svg>")
 
 
-def build(*, sweep, front, recs, sizes, tiers, sens, chan, corr, ch, top,
-          n_cand, n_ord, n_floor, n_both, floor_front, floor_sweep, splits, **_):
+def build(*, sweep, front, recs, sizes, tiers, sens, chan, top,
+          n_cand, n_ord, n_floor, n_both, floor_front, floor_sweep, splits,
+          candidate_run_id, **_):
     P = []
     add = P.append
 
@@ -246,8 +247,8 @@ at once. Plot all the efficient ones and you get a frontier: the menu of sensibl
     add("""<section>
 <h2>The efficient frontier</h2>
 <p class="measure">Each dot is one candidate allocation. Grey dots are dominated &mdash; something
-else beats them on both axes. Teal dots are efficient. <strong>Outlined dots are efficient but
-carry a caveat</strong> (explained below); they are kept in the picture rather than quietly
+else beats them on both axes. Teal dots are efficient. <strong>Outlined dots carry a caveat</strong>
+(explained below), whether efficient or dominated; they are kept in the picture rather than quietly
 removed.</p>""")
 
     add('<div class="legend"><span><i style="background:var(--dot)"></i>dominated</span>'
@@ -311,7 +312,7 @@ recommendation whose ordering against a neighbour is unresolved.</p>
     # -------------------------------------------------------- recommendations
     add(f"""<section>
 <h2>Recommendations by risk appetite</h2>
-<p class="measure">Four picks under normal conditions, chosen by a fixed rule rather than
+<p class="measure">Five picks under normal conditions, chosen by a fixed rule rather than
 judgement. Caveats sit next to the number they qualify.</p>
 <div class="scroll"><table>
 <thead><tr><th>Risk appetite &amp; budget split</th><th>Expected revenue</th><th>Return on spend</th>
@@ -389,6 +390,12 @@ money.</p>
     agg = tiers[2][2]
     agg_bad = sens[(sens.allocation_id == agg.allocation_id)
                    & (sens.scenario_id == "platform_algo_change")].iloc[0]
+    normal_roas = (sweep[sweep.scenario_id == "normal"]
+                   .set_index("allocation_id")["expected_roas"])
+    recession_roas = (sweep[sweep.scenario_id == "recession"]
+                      .set_index("allocation_id")["expected_roas"])
+    recession_factor = recession_roas / normal_roas
+    recession_factor_spread = float(recession_factor.max() - recession_factor.min())
     add(f"""<div class="callout alarm"><h3>The lowest-volatility option is not the safest one</h3>
 <p>"Conservative" here means <em>least variable</em>, not <em>least likely to lose money</em>.
 Under a platform change it returns <strong>{cons_bad.expected_roas:.2f}&times;</strong>
@@ -399,7 +406,8 @@ loses money in a recession too. The aggressive pick returns
 allocation is the wrong instrument.</p>
 <p><strong>Be precise about why, because the model is simpler than this table looks.</strong>
 Each condition applies a near-uniform multiplier to every allocation &mdash; across all
-{n_cand:,} candidates the recession factor varies by less than 0.002 &mdash; so these columns are
+{n_cand:,} candidates the recession factor ranges from {recession_factor.min():.4f} to
+{recession_factor.max():.4f} (a {recession_factor_spread:.4f} spread) &mdash; so these columns are
 essentially the normal one times three constants. <em>No allocation is specifically fragile to a
 downturn in this model.</em> The conservative pick loses money because its base-case return is
 barely above break-even at {tiers[0][2].expected_roas:.2f}&times;, not because steadiness makes it
@@ -410,56 +418,44 @@ change; {below_thresh} of {n_cand:,} candidates are.</p>
 
     # -------------------------------------------------------------- channels
     top_id = html.escape(str(top.allocation_id))
-    rev_lead = chan.loc[chan.revenue_pct.idxmax()]
-    corr_off = [(corr[i][j], ch[i], ch[j])
-                for i in range(len(ch)) for j in range(i + 1, len(ch))]
-    tight = max(corr_off); loose = min(corr_off)
-    least = min(range(len(ch)),
-                key=lambda i: sum(corr[i][j] for j in range(len(ch)) if j != i))
+    spend_lead = chan.loc[chan.spend_pct.idxmax()]
+    return_up = chan.loc[chan.return_corr.idxmax()]
     add(f"""<section>
 <h2>Where the money goes, and where the risk comes from</h2>
 <p class="measure">Channel breakdown for the aggressive pick (<code>{top_id}</code>), the
 highest-expected-revenue allocation on the frontier.</p>
 <div class="scroll"><table>
-<thead><tr><th>Channel</th><th>Spend</th><th>Share</th><th>Expected revenue</th>
-<th>Share</th><th>Return</th><th>Risk link</th><th>Saturates at</th><th></th></tr></thead><tbody>""")
+<thead><tr><th>Channel</th><th>Spend</th><th>Share</th><th>Return link</th>
+<th>Risk link</th></tr></thead><tbody>""")
     for r in chan.itertuples():
-        flag = ('<span class="chip chip-floor">priced at floor</span>'
-                if r.floored else "")
         add(f"""<tr><td>{r.channel}</td><td>{money(r.spend)}</td>
-<td>{100*r.spend_pct:.1f}%</td><td>{money(r.revenue)}</td>
-<td>{100*r.revenue_pct:.1f}%</td><td>{r.roas:.2f}&times;</td>
-<td>{r.risk_corr:+.2f}</td><td>{r.theta:.3f}</td>
-<td style="text-align:left">{flag}</td></tr>""")
+<td>{100*r.spend_pct:.1f}%</td><td>{r.return_corr:+.2f}</td>
+<td>{r.risk_corr:+.2f}</td></tr>""")
     add(f"""<tr class="total"><td>Total</td><td>{money(chan.spend.sum())}</td><td>100.0%</td>
-<td>{money(chan.revenue.sum())}</td><td>100.0%</td>
-<td>{chan.revenue.sum()/chan.spend.sum():.2f}&times;</td><td></td><td></td><td></td></tr>
+<td></td><td></td></tr>
 </tbody></table></div>""")
 
     risk_up = chan.loc[chan.risk_corr.idxmax()]
     risk_down = chan.loc[chan.risk_corr.idxmin()]
     add(f"""<div class="stack measure">
-<p><strong>Revenue is concentrated; diversification is not.</strong>
-{rev_lead.channel} takes {100*rev_lead.spend_pct:.0f}% of the budget and produces
-{100*rev_lead.revenue_pct:.0f}% of expected revenue. The <strong>risk link</strong> is independently
-grounded in the stored gold sweep: across all {n_cand:,} normal-scenario allocations, a larger
+<p><strong>Revenue-seeking weight and risk-reducing weight are not the same.</strong>
+{spend_lead.channel} takes {100*spend_lead.spend_pct:.0f}% of the aggressive budget. Across all
+{n_cand:,} normal-scenario allocations, a larger {return_up.channel} share has the strongest
+association with higher expected revenue (the <strong>return link</strong>,
+{return_up.return_corr:+.2f}). A larger
 {risk_up.channel} share has the strongest association with more volatility
 (correlation {risk_up.risk_corr:+.2f}), while a larger {risk_down.channel} share has the strongest
 association with less volatility ({risk_down.risk_corr:+.2f}). That makes the distinction
-visible channel by channel instead of treating expected revenue as a proxy for risk.</p>
+visible channel by channel without inventing channel-level revenue that was never persisted.</p>
 <p><em>The honest caveat:</em> this is an association across candidate portfolios, not a causal
 risk attribution; budget shares must add to 100%, so raising one always lowers another.
-Conversion rates across {tight[1]} and {tight[2]} move together most tightly
-(correlation {tight[0]:.2f}), while <strong>{ch[least]}</strong> is least correlated with the
-others. But own-variance and cross-channel correlation are tangled together here, and the model
-correlates only conversion rates &mdash; click costs and order values are drawn independently.
-The risk link therefore shows which channel weights travel with portfolio volatility in gold,
-not how much volatility a channel causes by itself.</p>
-<p>"Saturates at" is how quickly a channel gets more expensive as you push budget into it, on a
-0-to-1 scale: 0 means cost never rises, and higher numbers mean it rises faster. At 0.352,
-doubling spend on paid search raises its cost per click by about 28%; at 0.120, display rises
-about 9%. This is the single most consequential
-assumption in the model, and it is <em>assumed</em>, not measured &mdash; see the limitations.</p>
+The model also correlates only conversion rates &mdash; click costs and order values are drawn
+independently. The links therefore show which channel weights travel with portfolio return and
+volatility in gold, not how much revenue or volatility a channel causes by itself.</p>
+<p>The table deliberately does not assign per-channel revenue or a causal risk contribution:
+neither was persisted by the verified run, and recreating them would violate the no-recompute
+rule. Exact spend comes from that run's persisted candidate file and is checked back to live
+gold before rendering.</p>
 </div>
 </section>""")
 
@@ -502,8 +498,9 @@ Do not read a ranking into those.</p>
 anything in the historical record, so its cost was held at the lowest observed level instead of
 extrapolated downward. This bounds the estimate rather than fixing it &mdash; the optimizer can
 still propose a channel funded at a token amount, and here the smallest funded channel is
-{money(chan.spend.min())}. Its apparent return of
-{chan.loc[chan.spend.idxmin()].roas:.2f}&times; is an artifact of that floor, not a finding.</p>
+{money(chan.spend.min())}. The report does not assign a channel return to that token amount,
+because no per-channel revenue was persisted and analytically recreating one would overstate
+what the verified gold data contains.</p>
 </div>
 
 <div class="callout"><h3>3. The distributed computing was proven, but was not necessary</h3>
@@ -531,15 +528,12 @@ tail risk rather than overstating it.</p>
 (<code>allocation_sweep_results</code>, <code>efficient_frontier</code>,
 <code>frontier_recommendations</code>) at render time &mdash; {len(sweep):,} allocation-scenario
 results, {len(front)} frontier points, {len(recs)} recommendations. Nothing here is re-simulated
-or transcribed. <strong>Two things on this page do not come from those tables and should not be
-read as if they did.</strong> The stored results are held at allocation level, so per-channel
-<em>budget splits</em> are reconstructed from the candidate generator &mdash; deterministic given
-the fixed seed, and cross-checked against a spend-derived fact gold does store &mdash; and
-per-channel <em>revenue</em> uses the closed-form expectation the pipeline validates against the
-simulation. That closed form is why the channel table totals {money(chan.revenue.sum())} against
-the simulated {money(top.mean_revenue)} for the same allocation: a
-{100*abs(chan.revenue.sum()-top.mean_revenue)/top.mean_revenue:.2f}% gap between an exact formula
-and a 10,000-path average, not a discrepancy.</p>
+or transcribed. <strong>One input does not live in those three tables:</strong> gold is held at
+allocation level, so exact per-channel budget splits are read from the candidate Parquet files
+persisted by successful Phase 5 Workflow run {candidate_run_id}. Before use, the report checks
+that all {n_cand:,} candidate ids and every persisted aggregate result align with live gold.
+The return/risk links combine those exact shares with gold's stored mean and volatility; they do
+not recreate channel revenue, draw paths, or regenerate candidates.</p>
 </div>""")
 
     return (f'<title>Budget Allocation Under Uncertainty</title>\n'
