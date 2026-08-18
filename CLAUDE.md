@@ -37,7 +37,7 @@ Structured to demonstrate three roles in one system:
   0.5477→0.5278, separation 34.7x→33.5x); code was unchanged and always correct.
 - **Branch strategy:** phases stay on separate branches; all merge into `main`
   together after all phases are done. Don't merge early without being told to.
-- **Phase 3 (Distributed Batch Simulation):** IN PROGRESS on branch
+- **Phase 3 (Distributed Batch Simulation):** COMPLETE on branch
   `phase-3-distributed-simulation` (branched off `phase-2-simulation-engine` at
   `bcfeba3`). Distributes the validated Phase 2 engine across Spark
   (`applyInPandas`) over 21 allocations x 4 scenarios x 10,000 paths
@@ -198,7 +198,7 @@ Structured to demonstrate three roles in one system:
   The distributed-run commit was originally `98c7828`; its message was amended
   to correct the same four prose figures (same pattern as Phase 2's
   `85b89a7` → `bcfeba3`). Code and data were unchanged and always correct.
-- **Phase 4 prerequisite (spend-saturation curve):** IN PROGRESS on branch
+- **Phase 4 prerequisite (spend-saturation curve):** COMPLETE on branch
   `phase-4-saturation-curve` (branched off `phase-3-distributed-simulation`
   at `bfc3b46`). Fixes the degenerate frontier described below BEFORE any
   optimization work starts. Diminishing returns enter at the CPC step rather
@@ -373,7 +373,7 @@ Structured to demonstrate three roles in one system:
   in different places. Ranks are now tie-averaged and the value is a stable
   -0.5082, matching scipy. This never affected pass/fail: the asserted
   variables have no ties.
-- **Phase 4 (Optimization sweep / efficient frontier):** IN PROGRESS on branch
+- **Phase 4 (Optimization sweep / efficient frontier):** COMPLETE on branch
   `phase-4-optimization` (branched off `phase-4-saturation-curve` at
   `28f0d62`). The saturation prerequisite above is what makes this meaningful
   at all — without it the answer is a corner and there is nothing to trace.
@@ -665,7 +665,7 @@ Structured to demonstrate three roles in one system:
   "unconfirmed" rather than "refuted". Either way the ordering story is not
   currently supported by data, and Phase 6 must not present theta as measured.
 
-- **Phase 5 (Orchestration & Tracking):** IN PROGRESS on branch
+- **Phase 5 (Orchestration & Tracking):** COMPLETE on branch
   `phase-5-orchestration` (branched off `phase-4-spend-floor` at `a289016`).
   Wires the ALREADY-VALIDATED pipeline into a persisted Databricks Workflow and
   instruments it with MLflow. NO modeling changes: simulation math, theta, the
@@ -969,12 +969,23 @@ Structured to demonstrate three roles in one system:
   expressly forbids. The HTML states the proxy and source boundary instead of
   fabricating a stronger result.
 
+  **2026-08-18 repository audit follow-up.** GitHub issues #1-#3 record three
+  confirmed repository-level defects found after Phase 6: the public README
+  stopped at Phase 2 and miscounted the bronze tables; the report hard-coded
+  the default catalog, Workflow id, $500,000 budget and 10,000 paths despite
+  the documented parameterized Workflow; and no automated offline regression
+  or CI suite existed. The fixes parameterize deployment identifiers through
+  CLI options, validate budget/path count from live gold, compute candidate
+  shares from each persisted row total, refresh the README through Phase 6,
+  and add GitHub Actions plus nine credential-free pytest contracts. Local
+  verification: all Python sources compile, 9/9 tests pass, live gold remains
+  3,884 / 519 / 36, the candidate artifact still matches, and two consecutive
+  renders are byte-identical at SHA-256
+  `1FCE06EAB28A52091C3792E54D779B6B38300F51FE270E221FD3123AE66B7406`.
+
   Published as a Claude artifact for viewing — NOT to Databricks; no HTML is
   written to any UC volume, the workspace tree or MLflow. NOT MERGED — the standing rule is that
   the merge is the user's call, and it has been put to them rather than assumed.
-- **Later:** Phase 5 (Workflows +
-  MLflow orchestration), Phase 6 (analysis & reporting).
-
   **HISTORICAL — this describes the LINEAR model, FIXED by the saturation
   curve above. Kept because it explains why that curve exists, and because
   Delta `VERSION AS OF 16` of `simulated_allocation_outcomes` still holds this

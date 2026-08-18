@@ -7,6 +7,11 @@ ROAS is the "return", cross-channel correlation is the "risk", and the eventual
 goal is an efficient frontier of budget allocations. Built on Databricks
 (Delta Lake, Workflows, MLflow).
 
+The implementation is complete through Phase 6 on phase-specific branches.
+Those branches have intentionally not been merged into `main`; review
+`CLAUDE.md` for the verified run history, exact caveats, and current branch
+status.
+
 ## Repo layout
 
 ```
@@ -14,11 +19,15 @@ data_generation/   synthetic history generator (no Spark -- plain CSV out)
 data/raw/          generated CSV lands here (gitignored; reproducible by seed)
 data/validation/   validation artifacts, e.g. correlation heatmap (gitignored)
 databricks/        manually-run scripts for the Databricks side
+simulation/        Monte Carlo engine, distributed sweep, frontier, Workflow code
+reporting/         live-gold Phase 6 report builder and generated HTML report
+tests/             offline deterministic regression tests
+.github/workflows/ automated compile and offline pytest checks
 ```
 
 ## Phase 1 -- Data foundation (bronze layer)
 
-Produces three Delta tables in `ad_mc_poc.bronze`:
+Produces four Delta tables in `ad_mc_poc.bronze`:
 
 | table | grain | contents |
 |---|---|---|
@@ -156,7 +165,86 @@ Per path, per channel: `clicks = spend / CPC`, `conversions = clicks * CVR`,
   now carries three distributions but one type column. Phase 2's families come
   from the spec, not that column, so it stays descriptive-only.
 
-## Later phases (not started)
+## Phase 3 -- Distributed simulation
 
-Distributing the simulation across a cluster, Workflows orchestration, and
-MLflow instrumentation are out of scope until Phase 2 is signed off.
+Phase 3 wraps the validated engine in a Spark `applyInPandas` batch over 21
+allocation probes, four scenarios, and the configured path count. In this
+workspace Python UDFs run on transient serverless job compute; the retained
+classic-cluster helper is not usable here.
+
+```bash
+python databricks/06_create_phase3_tables.py
+python databricks/07_load_phase3_reference.py
+python simulation/run_phase3_distributed.py
+```
+
+The run populates `silver.simulated_allocation_outcomes`; it does not create a
+persisted Workflow or MLflow run. Those belong to Phase 5.
+
+## Phase 4 -- Saturation, optimization, and gold
+
+Phase 4 adds the documented spend-saturation curve and evidence floor, then
+runs a two-stage candidate sweep. It writes three allocation-grain gold tables:
+
+- `gold.allocation_sweep_results`
+- `gold.efficient_frontier`
+- `gold.frontier_recommendations`
+
+```bash
+python databricks/08_create_gold_frontier.py
+python simulation/load_phase4_gold.py
+```
+
+The theta values controlling diminishing returns are elicited assumptions, not
+measurements. The bronze history does not cover enough spend variation to
+validate their published channel ordering; this limitation is carried into the
+Phase 6 report rather than hidden.
+
+## Phase 5 -- Databricks Workflow and MLflow
+
+Phase 5 deploys the already-validated pipeline as a five-task, parameterized
+Databricks Workflow and records one MLflow run per Workflow run.
+
+```bash
+python simulation/run_phase5_workflow.py --deploy-only
+python simulation/run_phase5_workflow.py --run-only
+```
+
+The Workflow is persisted but deliberately has no schedule or continuous
+trigger. A plain invocation deploys and runs it; use the explicit modes above
+when only one action is intended.
+
+## Phase 6 -- Analysis and report
+
+Phase 6 reads the verified gold results and the exact candidate Parquets from
+the matching successful Phase 5 run. It does not regenerate candidates or run
+Monte Carlo paths.
+
+```bash
+python reporting/build_report.py
+python reporting/build_report.py --help
+```
+
+The generated self-contained report is
+`reporting/budget_allocation_report.html`. Catalog, Phase 5 job id, output path,
+budget, and path-count handling are explicit: deployment identifiers are CLI
+options, while budget and path count are validated from live gold.
+
+Gold is allocation-grain and does not contain per-channel revenue or component
+risk. The report therefore presents exact channel spend plus descriptive links
+between channel share and gold-level return/risk, and says plainly that this is
+not causal contribution attribution.
+
+## Offline checks
+
+The deterministic contracts can be checked without Databricks credentials:
+
+```bash
+pip install -r requirements-dev.txt
+python -m compileall -q data_generation databricks simulation reporting tests
+python -m pytest -q
+```
+
+GitHub Actions runs the same compile and pytest checks on pushes and pull
+requests. Live-table verification remains a separate read-only Databricks step
+because CI intentionally has no workspace credentials.
