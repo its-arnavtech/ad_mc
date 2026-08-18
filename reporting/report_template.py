@@ -190,7 +190,7 @@ def scatter(sub, front_ids, risk_col, ordering_ids=(), w=470, h=290):
 
 def build(*, sweep, front, recs, sizes, tiers, sens, chan, top,
           n_cand, n_ord, n_floor, n_both, floor_front, floor_sweep, splits,
-          candidate_run_id, **_):
+          candidate_run_id, total_budget, n_paths, **_):
     P = []
     add = P.append
 
@@ -210,10 +210,10 @@ def build(*, sweep, front, recs, sizes, tiers, sens, chan, top,
 
     # ---------------------------------------------------------------- header
     add(f"""<header class="head">
-<p class="eyebrow">Ad budget allocation &middot; $500,000 per period &middot; simulated risk analysis</p>
+<p class="eyebrow">Ad budget allocation &middot; {money(total_budget)} per period &middot; simulated risk analysis</p>
 <h1>Where to put the budget, and what could go wrong</h1>
 <p class="lede measure">We tested <strong>{n_cand:,} different ways</strong> of splitting a
-$500,000 budget across five advertising channels, simulating 10,000 possible outcomes for each
+{money(total_budget)} budget across {len(chan)} advertising channels, simulating {n_paths:,} possible outcomes for each
 under four market conditions. <strong>The budget carries no time period</strong> &mdash; whether
 that is a month or a year changes whether these figures are plausible at all; see limitations. This is what the results support &mdash; and, just as importantly,
 what they do not.</p>
@@ -228,10 +228,10 @@ A channel has a <strong>return</strong> (revenue per dollar spent) and a <strong
 (how much that return swings). Channels also move together &mdash; when conversion rates dip,
 they tend to dip across several channels at once &mdash; so spreading the budget reduces risk
 by less than you might assume.</p>
-<p>Rather than predict one number, we simulate <strong>10,000 possible futures</strong> for every
+<p>Rather than predict one number, we simulate <strong>{n_paths:,} possible futures</strong> for every
 candidate split. That produces a distribution, which lets us talk about the bad cases directly:</p>
 <ul>
-<li><strong>Expected revenue</strong> &mdash; the average across all 10,000 simulated outcomes.</li>
+<li><strong>Expected revenue</strong> &mdash; the average across all {n_paths:,} simulated outcomes.</li>
 <li><strong>Volatility</strong> &mdash; how widely those outcomes spread. Lower means more predictable.</li>
 <li><strong>Worst-case floor (VaR-95)</strong> &mdash; you beat this number in 95% of simulations.
 A plain-language version: "19 times out of 20, revenue lands above this."</li>
@@ -399,7 +399,7 @@ money.</p>
     add(f"""<div class="callout alarm"><h3>The lowest-volatility option is not the safest one</h3>
 <p>"Conservative" here means <em>least variable</em>, not <em>least likely to lose money</em>.
 Under a platform change it returns <strong>{cons_bad.expected_roas:.2f}&times;</strong>
-&mdash; {money(cons_bad.mean_revenue)} on {money(500000)} of spend, a real loss &mdash; and it
+&mdash; {money(cons_bad.mean_revenue)} on {money(total_budget)} of spend, a real loss &mdash; and it
 loses money in a recession too. The aggressive pick returns
 <strong>{agg_bad.expected_roas:.2f}&times;</strong> in that same bad scenario.</p>
 <p>If the goal is to avoid losing money rather than to avoid surprises, the low-volatility

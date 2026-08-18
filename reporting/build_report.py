@@ -4,7 +4,7 @@ Phase 6 -- build the budget-allocation report from the gold tables.
 EVERY RESULT IN THE OUTPUT COMES FROM A QUERY RUN BY THIS SCRIPT. Nothing is
 transcribed from an earlier phase's report, and nothing is re-simulated: the
 Monte Carlo already ran, was verified, and lives in
-`ad_mc_poc.gold.{allocation_sweep_results, efficient_frontier,
+`<catalog>.gold.{allocation_sweep_results, efficient_frontier,
 frontier_recommendations}`. This module reads those three tables and renders.
 
 The ONE source outside those tables is stated because it is a real data-model
@@ -18,11 +18,12 @@ link" are descriptive correlations between exact spend shares and gold's
 stored allocation-level mean/std metrics.
 
     python reporting/build_report.py
+    python reporting/build_report.py --catalog ad_mc_poc --phase5-job-id 94493651519110
 """
 
 from __future__ import annotations
 
-import html
+import argparse
 import io
 import pathlib
 import sys
@@ -37,9 +38,9 @@ import pandas as pd  # noqa: E402
 import data_access as DA  # noqa: E402
 from _common import resolve_warehouse_id, sql  # noqa: E402
 
-GOLD = "ad_mc_poc.gold"
-OUT = REPO / "reporting" / "budget_allocation_report.html"
-PHASE5_JOB_ID = 94493651519110
+DEFAULT_CATALOG = "ad_mc_poc"
+DEFAULT_OUT = REPO / "reporting" / "budget_allocation_report.html"
+DEFAULT_PHASE5_JOB_ID = 94493651519110
 
 SCEN_ORDER = ["seasonal_peak", "normal", "recession", "platform_algo_change"]
 SCEN_LABEL = {
@@ -57,37 +58,38 @@ PAIR_LABEL = {
 
 # ---------------------------------------------------------------- data access
 
-def load(w, wid):
-    """Everything the report renders, in four queries."""
+def load(w, wid, gold: str):
+    """Everything the report renders, in three read-only gold queries."""
     def frame(q):
         cols, rows = sql(w, wid, q)
         return pd.DataFrame(rows, columns=cols)
 
     sweep = frame(f"""
-        SELECT allocation_id, scenario_id, stage, family,
-               mean_revenue, std_revenue, var_95, cvar_95, expected_roas,
+        SELECT allocation_id, scenario_id, stage, family, n_paths,
+               total_spend, mean_revenue, std_revenue, var_95, cvar_95, expected_roas,
                extrapolation_floor_applied, n_channels_floored
-        FROM {GOLD}.allocation_sweep_results
+        FROM {gold}.allocation_sweep_results
     """)
     front = frame(f"""
         SELECT scenario_id, objective_pair, allocation_id, mean_revenue,
                std_revenue, var_95, cvar_95, rank_by_return,
                extrapolation_floor_applied
-        FROM {GOLD}.efficient_frontier
+        FROM {gold}.efficient_frontier
     """)
     recs = frame(f"""
         SELECT scenario_id, objective_pair, recommendation, allocation_id,
                mean_revenue, std_revenue, var_95, cvar_95, expected_roas,
                n_efficient, ordering_unresolved, extrapolation_floor_applied,
                nearest_neighbour_gap
-        FROM {GOLD}.frontier_recommendations
+        FROM {gold}.frontier_recommendations
     """)
     for df in (sweep, front, recs):
         for c in df.columns:
-            if c in ("mean_revenue", "std_revenue", "var_95", "cvar_95",
+            if c in ("total_spend", "mean_revenue", "std_revenue", "var_95", "cvar_95",
                      "expected_roas", "nearest_neighbour_gap"):
                 df[c] = df[c].astype(float)
-            elif c in ("rank_by_return", "n_efficient", "stage", "n_channels_floored"):
+            elif c in ("rank_by_return", "n_efficient", "stage", "n_paths",
+                       "n_channels_floored"):
                 df[c] = df[c].astype("Int64")
             elif c in ("extrapolation_floor_applied", "ordering_unresolved"):
                 df[c] = df[c].astype(str).str.lower().eq("true")
@@ -101,7 +103,8 @@ def _read_volume_parquet(w, path: str) -> pd.DataFrame:
     return pd.read_parquet(io.BytesIO(response.contents.read()))
 
 
-def load_persisted_candidates(w, sweep: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+def load_persisted_candidates(w, sweep: pd.DataFrame, *, catalog: str,
+                              phase5_job_id: int) -> tuple[pd.DataFrame, int]:
     """Exact candidate vectors from the latest successful Phase 5 run.
 
     The result Parquets are checked against live gold before the candidate
@@ -109,20 +112,20 @@ def load_persisted_candidates(w, sweep: pd.DataFrame) -> tuple[pd.DataFrame, int
     not a reconstructed approximation whose ids merely happen to line up.
     """
     runs = []
-    for run in w.jobs.list_runs(job_id=PHASE5_JOB_ID, completed_only=True):
+    for run in w.jobs.list_runs(job_id=phase5_job_id, completed_only=True):
         result = getattr(getattr(run, "state", None), "result_state", None)
         if str(getattr(result, "value", result)).upper() == "SUCCESS":
             runs.append(run)
     runs.sort(key=lambda r: int(getattr(r, "start_time", 0) or 0), reverse=True)
     if not runs:
-        raise RuntimeError(f"no successful runs found for Phase 5 job {PHASE5_JOB_ID}")
+        raise RuntimeError(f"no successful runs found for Phase 5 job {phase5_job_id}")
 
     metric_cols = ["mean_revenue", "std_revenue", "var_95", "cvar_95", "expected_roas"]
     gold = sweep.set_index(["allocation_id", "scenario_id"]).sort_index()
     failures = []
     for run in runs:
         run_id = int(run.run_id)
-        base = f"/Volumes/ad_mc_poc/bronze/landing/phase5/run_{run_id}"
+        base = f"/Volumes/{catalog}/bronze/landing/phase5/run_{run_id}"
         try:
             candidates = pd.concat([
                 _read_volume_parquet(w, f"{base}/stage1_candidates.parquet"),
@@ -141,6 +144,13 @@ def load_persisted_candidates(w, sweep: pd.DataFrame) -> tuple[pd.DataFrame, int
             continue
         if set(candidates.allocation_id) != set(sweep.allocation_id):
             failures.append(f"run {run_id}: candidate ids do not match gold")
+            continue
+        spend_cols = [c for c in candidates.columns if c.startswith("spend_")]
+        candidate_totals = candidates[spend_cols].sum(axis=1).to_numpy(float)
+        gold_budgets = sweep["total_spend"].dropna().astype(float).unique()
+        if len(gold_budgets) != 1 or not np.allclose(
+                candidate_totals, gold_budgets[0], rtol=0.0, atol=1e-6):
+            failures.append(f"run {run_id}: candidate spend totals do not match gold")
             continue
         persisted = results.set_index(["allocation_id", "scenario_id"]).sort_index()
         if not persisted.index.equals(gold.index):
@@ -176,10 +186,13 @@ def channel_breakdown(candidates: pd.DataFrame, sweep: pd.DataFrame,
               .drop_duplicates("allocation_id"))
     portfolio = candidates[["allocation_id", *spend_cols]].merge(
         normal, on="allocation_id", validate="one_to_one")
+    portfolio_total = portfolio[spend_cols].sum(axis=1).to_numpy(float)
+    if not np.all(np.isfinite(portfolio_total)) or np.any(portfolio_total <= 0.0):
+        raise RuntimeError("persisted candidate artifacts contain an invalid total spend")
 
     rows = []
     for col, channel, amount in zip(spend_cols, channels, spend):
-        shares = portfolio[col].to_numpy(float) / 500_000.0
+        shares = portfolio[col].to_numpy(float) / portfolio_total
         rows.append({
             "channel": channel,
             "spend": amount,
@@ -194,14 +207,48 @@ def channel_breakdown(candidates: pd.DataFrame, sweep: pd.DataFrame,
 
 # ------------------------------------------------------------------ rendering
 
-def main() -> None:
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Render the Phase 6 report from verified Databricks outputs.")
+    parser.add_argument("--catalog", default=DEFAULT_CATALOG,
+                        help=f"Unity Catalog catalog (default: {DEFAULT_CATALOG})")
+    parser.add_argument("--phase5-job-id", type=int, default=DEFAULT_PHASE5_JOB_ID,
+                        help="Persisted Phase 5 Workflow job id")
+    parser.add_argument("--output", type=pathlib.Path, default=DEFAULT_OUT,
+                        help=f"HTML output path (default: {DEFAULT_OUT})")
+    return parser.parse_args(argv)
+
+
+def report_run_shape(sweep: pd.DataFrame) -> tuple[float, int]:
+    """Return the single (budget, paths) configuration represented by gold."""
+    budgets = sweep["total_spend"].dropna().astype(float).unique()
+    if len(budgets) != 1 or not np.isfinite(budgets[0]) or budgets[0] <= 0.0:
+        raise RuntimeError(
+            f"gold must contain one positive total_spend; found {budgets.tolist()}")
+    path_counts = sweep["n_paths"].dropna().astype(int).unique()
+    if len(path_counts) != 1 or path_counts[0] <= 0:
+        raise RuntimeError(
+            f"gold must contain one positive n_paths; found {path_counts.tolist()}")
+    return float(budgets[0]), int(path_counts[0])
+
+
+def main(argv=None) -> None:
+    args = parse_args(argv)
+    catalog = args.catalog.strip()
+    if not catalog or not catalog.replace("_", "a").isalnum():
+        raise ValueError(f"invalid catalog name {args.catalog!r}")
+    gold = f"{catalog}.gold"
+
     w, wid = DA.open_session()
     wid = wid or resolve_warehouse_id(w)
-    sweep, front, recs = load(w, wid)
+    sweep, front, recs = load(w, wid, gold)
     print(f"loaded gold: sweep {len(sweep)}  frontier {len(front)}  recs {len(recs)}")
 
+    total_budget, n_paths = report_run_shape(sweep)
+
     n_cand = sweep.allocation_id.nunique()
-    candidates, candidate_run_id = load_persisted_candidates(w, sweep)
+    candidates, candidate_run_id = load_persisted_candidates(
+        w, sweep, catalog=catalog, phase5_job_id=args.phase5_job_id)
     print(f"candidate vectors loaded from verified Phase 5 run {candidate_run_id}")
     top = recs[(recs.scenario_id == "normal")
                & (recs.recommendation == "max_return")].iloc[0]
@@ -246,18 +293,19 @@ def main() -> None:
     floor_front = int(front.extrapolation_floor_applied.sum())
     floor_sweep = int(sweep.extrapolation_floor_applied.sum())
 
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(render(
+    output = args.output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(render(
         sweep, front, recs, sizes, tiers, sens, chan, top,
         n_cand, n_ord, n_floor, n_both, floor_front, floor_sweep, splits,
-        candidate_run_id,
+        candidate_run_id, total_budget, n_paths,
     ), encoding="utf-8")
-    print(f"wrote {OUT}  ({OUT.stat().st_size:,} bytes)")
+    print(f"wrote {output}  ({output.stat().st_size:,} bytes)")
 
 
 def render(sweep, front, recs, sizes, tiers, sens, chan, top,
            n_cand, n_ord, n_floor, n_both, floor_front, floor_sweep, splits,
-           candidate_run_id) -> str:
+           candidate_run_id, total_budget, n_paths) -> str:
     from report_template import build  # keeps markup out of the query code
     return build(**locals())
 
