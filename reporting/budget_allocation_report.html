@@ -320,47 +320,52 @@ change; 103 of 971 candidates are.</p>
 <section>
 <h2>Where the money goes, and where the risk comes from</h2>
 <p class="measure">Channel breakdown for the aggressive pick (<code>dir1_110</code>), the
-highest-expected-revenue allocation on the frontier.</p>
+highest-expected-revenue allocation on the frontier. Expected revenue and component volatility
+are path-level contributions from the approved targeted attribution run, reconciled exactly to
+the authoritative gold totals.</p>
 <div class="scroll"><table>
-<thead><tr><th>Channel</th><th>Spend</th><th>Share</th><th>Return link</th>
-<th>Risk link</th></tr></thead><tbody>
+<thead><tr><th>Channel</th><th>Spend</th><th>Share</th><th>Expected revenue</th>
+<th>Revenue share</th><th>Component volatility</th><th>Risk share</th></tr></thead><tbody>
 <tr><td>display</td><td>$98,871</td>
-<td>19.8%</td><td>+0.24</td>
-<td>+0.06</td></tr>
+<td>19.8%</td><td>$175,978</td>
+<td>16.7%</td><td>$17,943</td>
+<td>8.1%</td></tr>
 <tr><td>paid_search</td><td>$234,914</td>
-<td>47.0%</td><td>+0.67</td>
-<td>+0.82</td></tr>
+<td>47.0%</td><td>$567,083</td>
+<td>53.8%</td><td>$156,778</td>
+<td>70.8%</td></tr>
 <tr><td>paid_social</td><td>$131,236</td>
-<td>26.2%</td><td>+0.19</td>
-<td>+0.28</td></tr>
+<td>26.2%</td><td>$243,234</td>
+<td>23.1%</td><td>$41,343</td>
+<td>18.7%</td></tr>
 <tr><td>programmatic</td><td>$33,851</td>
-<td>6.8%</td><td>+0.03</td>
-<td>-0.06</td></tr>
+<td>6.8%</td><td>$64,317</td>
+<td>6.1%</td><td>$5,148</td>
+<td>2.3%</td></tr>
 <tr><td>video</td><td>$1,128</td>
-<td>0.2%</td><td>-0.80</td>
-<td>-0.79</td></tr>
+<td>0.2%</td><td>$4,078</td>
+<td>0.4%</td><td>$210</td>
+<td>0.1%</td></tr>
 <tr class="total"><td>Total</td><td>$500,000</td><td>100.0%</td>
-<td></td><td></td></tr>
+<td>$1,054,691</td><td>100.0%</td>
+<td>$221,421</td><td>100.0%</td></tr>
 </tbody></table></div>
 <div class="stack measure">
 <p><strong>Revenue-seeking weight and risk-reducing weight are not the same.</strong>
-paid_search takes 47% of the aggressive budget. Across all
-971 normal-scenario allocations, a larger paid_search share has the strongest
-association with higher expected revenue (the <strong>return link</strong>,
-+0.67). A larger
-paid_search share has the strongest association with more volatility
-(correlation +0.82), while a larger video share has the strongest
-association with less volatility (-0.79). That makes the distinction
-visible channel by channel without inventing channel-level revenue that was never persisted.</p>
-<p><em>The honest caveat:</em> this is an association across candidate portfolios, not a causal
-risk attribution; budget shares must add to 100%, so raising one always lowers another.
-The model also correlates only conversion rates &mdash; click costs and order values are drawn
-independently. The links therefore show which channel weights travel with portfolio return and
-volatility in gold, not how much revenue or volatility a channel causes by itself.</p>
-<p>The table deliberately does not assign per-channel revenue or a causal risk contribution:
-neither was persisted by the verified run, and recreating them would violate the no-recompute
-rule. Exact spend comes from that run's persisted candidate file and is checked back to live
-gold before rendering.</p>
+paid_search takes 47% of the aggressive budget.
+paid_search supplies the largest expected-revenue contribution at
+53.8% of the total. paid_search supplies the largest
+component of portfolio volatility at 70.8%, while
+video supplies the smallest at 0.1%.</p>
+<p><strong>How to read component volatility.</strong> For each channel it is the covariance of
+that channel's simulated revenue with total simulated revenue, divided by total volatility.
+This Euler decomposition adds back to portfolio volatility exactly. A negative component is a
+diversification benefit &mdash; it dampens the total &mdash; rather than impossible negative risk.
+It is a model-based attribution, not proof that changing one channel alone would cause the same
+change in revenue or risk.</p>
+<p>The attribution reuses the original allocation, scenario, seed and 10,000 paths from
+Phase 5 source Workflow run 322037088744573; its channel sums are reconciled to the stored
+gold mean and standard deviation. Method: <code>euler_std_v1: cov(channel,total)/std(total); reconciled_to_gold</code>.</p>
 </div>
 </section>
 <section>
@@ -401,9 +406,8 @@ Do not read a ranking into those.</p>
 anything in the historical record, so its cost was held at the lowest observed level instead of
 extrapolated downward. This bounds the estimate rather than fixing it &mdash; the optimizer can
 still propose a channel funded at a token amount, and here the smallest funded channel is
-$1,128. The report does not assign a channel return to that token amount,
-because no per-channel revenue was persisted and analytically recreating one would overstate
-what the verified gold data contains.</p>
+$1,128. The attribution reports the simulated contribution under the stated
+model, but that does not create empirical evidence below the historical spend floor.</p>
 </div>
 
 <div class="callout"><h3>3. The distributed computing was proven, but was not necessary</h3>
@@ -428,12 +432,13 @@ tail risk rather than overstating it.</p>
 <div class="foot measure">
 <p>Every figure on this page is queried live from the verified gold tables
 (<code>allocation_sweep_results</code>, <code>efficient_frontier</code>,
-<code>frontier_recommendations</code>) at render time &mdash; 3,884 allocation-scenario
-results, 519 frontier points, 36 recommendations. Nothing here is re-simulated
-or transcribed. <strong>One input does not live in those three tables:</strong> gold is held at
-allocation level, so exact per-channel budget splits are read from the candidate Parquet files
-persisted by successful Phase 5 Workflow run 322037088744573. Before use, the report checks
-that all 971 candidate ids and every persisted aggregate result align with live gold.
-The return/risk links combine those exact shares with gold's stored mean and volatility; they do
-not recreate channel revenue, draw paths, or regenerate candidates.</p>
+<code>frontier_recommendations</code>, and
+<code>recommendation_channel_contributions</code>) at render time &mdash; 3,884
+allocation-scenario results, 519 frontier points, 36 recommendations, and
+5 displayed channel contributions. The report itself does not draw paths, regenerate
+candidates, or simulate. The fourth table was produced once by an explicitly approved targeted
+rerun of the 24 unique recommendation cells, using exact candidate artifacts and each cell's
+original scenario, seed and path count from Phase 5 Workflow run 322037088744573. The
+loader rejected any aggregate mismatch before writing and reconciled channel sums to the
+authoritative allocation-level gold mean and volatility.</p>
 </div></div>

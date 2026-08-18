@@ -190,7 +190,7 @@ def scatter(sub, front_ids, risk_col, ordering_ids=(), w=470, h=290):
 
 def build(*, sweep, front, recs, sizes, tiers, sens, chan, top,
           n_cand, n_ord, n_floor, n_both, floor_front, floor_sweep, splits,
-          candidate_run_id, total_budget, n_paths, **_):
+          contribution_run_id, attribution_method, total_budget, n_paths, **_):
     P = []
     add = P.append
 
@@ -419,43 +419,44 @@ change; {below_thresh} of {n_cand:,} candidates are.</p>
     # -------------------------------------------------------------- channels
     top_id = html.escape(str(top.allocation_id))
     spend_lead = chan.loc[chan.spend_pct.idxmax()]
-    return_up = chan.loc[chan.return_corr.idxmax()]
+    revenue_lead = chan.loc[chan.revenue.idxmax()]
+    risk_lead = chan.loc[chan.risk_component.idxmax()]
+    risk_damper = chan.loc[chan.risk_component.idxmin()]
     add(f"""<section>
 <h2>Where the money goes, and where the risk comes from</h2>
 <p class="measure">Channel breakdown for the aggressive pick (<code>{top_id}</code>), the
-highest-expected-revenue allocation on the frontier.</p>
+highest-expected-revenue allocation on the frontier. Expected revenue and component volatility
+are path-level contributions from the approved targeted attribution run, reconciled exactly to
+the authoritative gold totals.</p>
 <div class="scroll"><table>
-<thead><tr><th>Channel</th><th>Spend</th><th>Share</th><th>Return link</th>
-<th>Risk link</th></tr></thead><tbody>""")
+<thead><tr><th>Channel</th><th>Spend</th><th>Share</th><th>Expected revenue</th>
+<th>Revenue share</th><th>Component volatility</th><th>Risk share</th></tr></thead><tbody>""")
     for r in chan.itertuples():
         add(f"""<tr><td>{r.channel}</td><td>{money(r.spend)}</td>
-<td>{100*r.spend_pct:.1f}%</td><td>{r.return_corr:+.2f}</td>
-<td>{r.risk_corr:+.2f}</td></tr>""")
+<td>{100*r.spend_pct:.1f}%</td><td>{money(r.revenue)}</td>
+<td>{100*r.revenue_pct:.1f}%</td><td>{money(r.risk_component)}</td>
+<td>{100*r.risk_pct:.1f}%</td></tr>""")
     add(f"""<tr class="total"><td>Total</td><td>{money(chan.spend.sum())}</td><td>100.0%</td>
-<td></td><td></td></tr>
+<td>{money(chan.revenue.sum())}</td><td>100.0%</td>
+<td>{money(chan.risk_component.sum())}</td><td>100.0%</td></tr>
 </tbody></table></div>""")
 
-    risk_up = chan.loc[chan.risk_corr.idxmax()]
-    risk_down = chan.loc[chan.risk_corr.idxmin()]
     add(f"""<div class="stack measure">
 <p><strong>Revenue-seeking weight and risk-reducing weight are not the same.</strong>
-{spend_lead.channel} takes {100*spend_lead.spend_pct:.0f}% of the aggressive budget. Across all
-{n_cand:,} normal-scenario allocations, a larger {return_up.channel} share has the strongest
-association with higher expected revenue (the <strong>return link</strong>,
-{return_up.return_corr:+.2f}). A larger
-{risk_up.channel} share has the strongest association with more volatility
-(correlation {risk_up.risk_corr:+.2f}), while a larger {risk_down.channel} share has the strongest
-association with less volatility ({risk_down.risk_corr:+.2f}). That makes the distinction
-visible channel by channel without inventing channel-level revenue that was never persisted.</p>
-<p><em>The honest caveat:</em> this is an association across candidate portfolios, not a causal
-risk attribution; budget shares must add to 100%, so raising one always lowers another.
-The model also correlates only conversion rates &mdash; click costs and order values are drawn
-independently. The links therefore show which channel weights travel with portfolio return and
-volatility in gold, not how much revenue or volatility a channel causes by itself.</p>
-<p>The table deliberately does not assign per-channel revenue or a causal risk contribution:
-neither was persisted by the verified run, and recreating them would violate the no-recompute
-rule. Exact spend comes from that run's persisted candidate file and is checked back to live
-gold before rendering.</p>
+{spend_lead.channel} takes {100*spend_lead.spend_pct:.0f}% of the aggressive budget.
+{revenue_lead.channel} supplies the largest expected-revenue contribution at
+{100*revenue_lead.revenue_pct:.1f}% of the total. {risk_lead.channel} supplies the largest
+component of portfolio volatility at {100*risk_lead.risk_pct:.1f}%, while
+{risk_damper.channel} supplies the smallest at {100*risk_damper.risk_pct:.1f}%.</p>
+<p><strong>How to read component volatility.</strong> For each channel it is the covariance of
+that channel's simulated revenue with total simulated revenue, divided by total volatility.
+This Euler decomposition adds back to portfolio volatility exactly. A negative component is a
+diversification benefit &mdash; it dampens the total &mdash; rather than impossible negative risk.
+It is a model-based attribution, not proof that changing one channel alone would cause the same
+change in revenue or risk.</p>
+<p>The attribution reuses the original allocation, scenario, seed and {n_paths:,} paths from
+Phase 5 source Workflow run {contribution_run_id}; its channel sums are reconciled to the stored
+gold mean and standard deviation. Method: <code>{html.escape(attribution_method)}</code>.</p>
 </div>
 </section>""")
 
@@ -498,9 +499,8 @@ Do not read a ranking into those.</p>
 anything in the historical record, so its cost was held at the lowest observed level instead of
 extrapolated downward. This bounds the estimate rather than fixing it &mdash; the optimizer can
 still propose a channel funded at a token amount, and here the smallest funded channel is
-{money(chan.spend.min())}. The report does not assign a channel return to that token amount,
-because no per-channel revenue was persisted and analytically recreating one would overstate
-what the verified gold data contains.</p>
+{money(chan.spend.min())}. The attribution reports the simulated contribution under the stated
+model, but that does not create empirical evidence below the historical spend floor.</p>
 </div>
 
 <div class="callout"><h3>3. The distributed computing was proven, but was not necessary</h3>
@@ -526,14 +526,15 @@ tail risk rather than overstating it.</p>
     add(f"""<div class="foot measure">
 <p>Every figure on this page is queried live from the verified gold tables
 (<code>allocation_sweep_results</code>, <code>efficient_frontier</code>,
-<code>frontier_recommendations</code>) at render time &mdash; {len(sweep):,} allocation-scenario
-results, {len(front)} frontier points, {len(recs)} recommendations. Nothing here is re-simulated
-or transcribed. <strong>One input does not live in those three tables:</strong> gold is held at
-allocation level, so exact per-channel budget splits are read from the candidate Parquet files
-persisted by successful Phase 5 Workflow run {candidate_run_id}. Before use, the report checks
-that all {n_cand:,} candidate ids and every persisted aggregate result align with live gold.
-The return/risk links combine those exact shares with gold's stored mean and volatility; they do
-not recreate channel revenue, draw paths, or regenerate candidates.</p>
+<code>frontier_recommendations</code>, and
+<code>recommendation_channel_contributions</code>) at render time &mdash; {len(sweep):,}
+allocation-scenario results, {len(front)} frontier points, {len(recs)} recommendations, and
+{len(chan)} displayed channel contributions. The report itself does not draw paths, regenerate
+candidates, or simulate. The fourth table was produced once by an explicitly approved targeted
+rerun of the 24 unique recommendation cells, using exact candidate artifacts and each cell's
+original scenario, seed and path count from Phase 5 Workflow run {contribution_run_id}. The
+loader rejected any aggregate mismatch before writing and reconciled channel sums to the
+authoritative allocation-level gold mean and volatility.</p>
 </div>""")
 
     return (f'<title>Budget Allocation Under Uncertainty</title>\n'

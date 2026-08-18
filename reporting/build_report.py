@@ -5,26 +5,19 @@ EVERY RESULT IN THE OUTPUT COMES FROM A QUERY RUN BY THIS SCRIPT. Nothing is
 transcribed from an earlier phase's report, and nothing is re-simulated: the
 Monte Carlo already ran, was verified, and lives in
 `<catalog>.gold.{allocation_sweep_results, efficient_frontier,
-frontier_recommendations}`. This module reads those three tables and renders.
-
-The ONE source outside those tables is stated because it is a real data-model
-boundary: gold is allocation-grain and does not store per-channel spend. The
-report therefore reads the exact stage-1/stage-2 candidate Parquet artifacts
-persisted by the latest successful Phase 5 Workflow run. Before use, their
-971 allocation ids and aggregate result rows are checked back against live
-gold. No candidate is regenerated, no RNG is called, and no channel revenue or
-risk component is analytically recomputed. Channel "return link" and "risk
-link" are descriptive correlations between exact spend shares and gold's
-stored allocation-level mean/std metrics.
+frontier_recommendations, recommendation_channel_contributions}`. This module
+reads those four tables and renders. Channel contribution rows were created by
+an approved targeted rerun using the original gold seeds/path counts and exact
+Phase 5 candidate spends, then reconciled to the authoritative allocation gold.
+The report itself performs no candidate generation, RNG, or simulation.
 
     python reporting/build_report.py
-    python reporting/build_report.py --catalog ad_mc_poc --phase5-job-id 94493651519110
+    python reporting/build_report.py --catalog ad_mc_poc
 """
 
 from __future__ import annotations
 
 import argparse
-import io
 import pathlib
 import sys
 
@@ -40,7 +33,6 @@ from _common import resolve_warehouse_id, sql  # noqa: E402
 
 DEFAULT_CATALOG = "ad_mc_poc"
 DEFAULT_OUT = REPO / "reporting" / "budget_allocation_report.html"
-DEFAULT_PHASE5_JOB_ID = 94493651519110
 
 SCEN_ORDER = ["seasonal_peak", "normal", "recession", "platform_algo_change"]
 SCEN_LABEL = {
@@ -59,13 +51,13 @@ PAIR_LABEL = {
 # ---------------------------------------------------------------- data access
 
 def load(w, wid, gold: str):
-    """Everything the report renders, in three read-only gold queries."""
+    """Everything the report renders, in four read-only gold queries."""
     def frame(q):
         cols, rows = sql(w, wid, q)
         return pd.DataFrame(rows, columns=cols)
 
     sweep = frame(f"""
-        SELECT allocation_id, scenario_id, stage, family, n_paths,
+        SELECT allocation_id, scenario_id, stage, family, n_paths, seed,
                total_spend, mean_revenue, std_revenue, var_95, cvar_95, expected_roas,
                extrapolation_floor_applied, n_channels_floored
         FROM {gold}.allocation_sweep_results
@@ -83,126 +75,113 @@ def load(w, wid, gold: str):
                nearest_neighbour_gap
         FROM {gold}.frontier_recommendations
     """)
-    for df in (sweep, front, recs):
+    contrib = frame(f"""
+        SELECT scenario_id, objective_pair, recommendation, allocation_id, channel_id,
+               phase5_workflow_run_id, n_paths, seed, total_spend, channel_spend,
+               spend_share, mean_revenue_contribution, revenue_share,
+               covariance_with_total_revenue, std_revenue_component, std_risk_share,
+               mean_reconciliation_factor, std_reconciliation_factor, attribution_method
+        FROM {gold}.recommendation_channel_contributions
+    """)
+    for df in (sweep, front, recs, contrib):
         for c in df.columns:
             if c in ("total_spend", "mean_revenue", "std_revenue", "var_95", "cvar_95",
-                     "expected_roas", "nearest_neighbour_gap"):
+                     "expected_roas", "nearest_neighbour_gap", "channel_spend",
+                     "spend_share", "mean_revenue_contribution", "revenue_share",
+                     "covariance_with_total_revenue", "std_revenue_component",
+                     "std_risk_share", "mean_reconciliation_factor",
+                     "std_reconciliation_factor"):
                 df[c] = df[c].astype(float)
             elif c in ("rank_by_return", "n_efficient", "stage", "n_paths",
-                       "n_channels_floored"):
+                       "n_channels_floored", "phase5_workflow_run_id"):
                 df[c] = df[c].astype("Int64")
             elif c in ("extrapolation_floor_applied", "ordering_unresolved"):
                 df[c] = df[c].astype(str).str.lower().eq("true")
-    return sweep, front, recs
+    return sweep, front, recs, contrib
 
 
-def _read_volume_parquet(w, path: str) -> pd.DataFrame:
-    response = w.files.download(path)
-    if response.contents is None:
-        raise RuntimeError(f"Databricks returned no content for {path}")
-    return pd.read_parquet(io.BytesIO(response.contents.read()))
+def contribution_breakdown(contrib: pd.DataFrame, recommendation: pd.Series) -> pd.DataFrame:
+    """Five persisted channel rows for one exact recommendation key."""
+    rows = contrib[
+        (contrib.scenario_id == recommendation.scenario_id)
+        & (contrib.objective_pair == recommendation.objective_pair)
+        & (contrib.recommendation == recommendation.recommendation)
+        & (contrib.allocation_id == recommendation.allocation_id)
+    ].copy()
+    if rows.empty or rows.channel_id.duplicated().any():
+        raise RuntimeError(
+            f"invalid contribution rows for {recommendation.scenario_id}/"
+            f"{recommendation.objective_pair}/{recommendation.recommendation}")
+    rows = rows.rename(columns={
+        "channel_id": "channel", "channel_spend": "spend",
+        "spend_share": "spend_pct", "mean_revenue_contribution": "revenue",
+        "revenue_share": "revenue_pct", "std_revenue_component": "risk_component",
+        "std_risk_share": "risk_pct",
+    })
+    return rows.sort_values("channel").reset_index(drop=True)
 
 
-def load_persisted_candidates(w, sweep: pd.DataFrame, *, catalog: str,
-                              phase5_job_id: int) -> tuple[pd.DataFrame, int]:
-    """Exact candidate vectors from the latest successful Phase 5 run.
+def validate_contributions(sweep: pd.DataFrame, recs: pd.DataFrame,
+                           contrib: pd.DataFrame) -> tuple[int, str]:
+    """Reject incomplete, duplicated, or unreconciled attribution gold."""
+    keys = ["scenario_id", "objective_pair", "recommendation", "allocation_id"]
+    if recs.duplicated(keys).any() or contrib.duplicated(keys + ["channel_id"]).any():
+        raise RuntimeError("recommendation contribution keys must be unique")
 
-    The result Parquets are checked against live gold before the candidate
-    vectors are trusted. This makes the Workflow artifact a persisted input,
-    not a reconstructed approximation whose ids merely happen to line up.
-    """
-    runs = []
-    for run in w.jobs.list_runs(job_id=phase5_job_id, completed_only=True):
-        result = getattr(getattr(run, "state", None), "result_state", None)
-        if str(getattr(result, "value", result)).upper() == "SUCCESS":
-            runs.append(run)
-    runs.sort(key=lambda r: int(getattr(r, "start_time", 0) or 0), reverse=True)
-    if not runs:
-        raise RuntimeError(f"no successful runs found for Phase 5 job {phase5_job_id}")
-
-    metric_cols = ["mean_revenue", "std_revenue", "var_95", "cvar_95", "expected_roas"]
-    gold = sweep.set_index(["allocation_id", "scenario_id"]).sort_index()
-    failures = []
-    for run in runs:
-        run_id = int(run.run_id)
-        base = f"/Volumes/{catalog}/bronze/landing/phase5/run_{run_id}"
-        try:
-            candidates = pd.concat([
-                _read_volume_parquet(w, f"{base}/stage1_candidates.parquet"),
-                _read_volume_parquet(w, f"{base}/stage2_candidates.parquet"),
-            ], ignore_index=True)
-            results = pd.concat([
-                _read_volume_parquet(w, f"{base}/stage1_results.parquet"),
-                _read_volume_parquet(w, f"{base}/stage2_results.parquet"),
-            ], ignore_index=True)
-        except Exception as exc:  # try the next earlier successful run
-            failures.append(f"run {run_id}: {type(exc).__name__}")
-            continue
-
-        if candidates.allocation_id.duplicated().any():
-            failures.append(f"run {run_id}: duplicate candidate ids")
-            continue
-        if set(candidates.allocation_id) != set(sweep.allocation_id):
-            failures.append(f"run {run_id}: candidate ids do not match gold")
-            continue
-        spend_cols = [c for c in candidates.columns if c.startswith("spend_")]
-        candidate_totals = candidates[spend_cols].sum(axis=1).to_numpy(float)
-        gold_budgets = sweep["total_spend"].dropna().astype(float).unique()
-        if len(gold_budgets) != 1 or not np.allclose(
-                candidate_totals, gold_budgets[0], rtol=0.0, atol=1e-6):
-            failures.append(f"run {run_id}: candidate spend totals do not match gold")
-            continue
-        persisted = results.set_index(["allocation_id", "scenario_id"]).sort_index()
-        if not persisted.index.equals(gold.index):
-            failures.append(f"run {run_id}: result keys do not match gold")
-            continue
-        mismatch = False
-        for col in metric_cols:
-            if not np.allclose(persisted[col].to_numpy(float), gold[col].to_numpy(float),
-                               rtol=1e-12, atol=1e-8, equal_nan=True):
-                failures.append(f"run {run_id}: {col} does not match gold")
-                mismatch = True
-                break
-        if mismatch:
-            continue
-        return candidates, run_id
-
-    raise RuntimeError(
-        "no successful Phase 5 candidate artifact matched live gold; "
-        + "; ".join(failures[:5])
+    grouped = contrib.groupby(keys, as_index=False).agg(
+        channels=("channel_id", "nunique"),
+        spend_sum=("channel_spend", "sum"),
+        total_spend=("total_spend", "max"),
+        total_spend_min=("total_spend", "min"),
+        spend_share_sum=("spend_share", "sum"),
+        mean_sum=("mean_revenue_contribution", "sum"),
+        revenue_share_sum=("revenue_share", "sum"),
+        std_sum=("std_revenue_component", "sum"),
+        risk_share_sum=("std_risk_share", "sum"),
     )
+    expected_channels = int(contrib.channel_id.nunique())
+    if expected_channels <= 0 or not (grouped.channels == expected_channels).all():
+        raise RuntimeError("every recommendation must contain every attributed channel")
+    joined = recs[keys + ["mean_revenue", "std_revenue"]].merge(
+        grouped, on=keys, how="outer", validate="one_to_one", indicator=True)
+    if len(joined) != len(recs) or not (joined._merge == "both").all():
+        raise RuntimeError("contribution recommendation keys do not match gold")
 
+    checks = (
+        np.isclose(joined.spend_sum, joined.total_spend, rtol=0.0, atol=1e-6),
+        np.isclose(joined.total_spend_min, joined.total_spend, rtol=0.0, atol=1e-12),
+        np.isclose(joined.spend_share_sum, 1.0, rtol=0.0, atol=1e-12),
+        np.isclose(joined.mean_sum, joined.mean_revenue, rtol=1e-12, atol=1e-6),
+        np.isclose(joined.revenue_share_sum, 1.0, rtol=0.0, atol=1e-12),
+        np.isclose(joined.std_sum, joined.std_revenue, rtol=1e-12, atol=1e-6),
+        np.isclose(joined.risk_share_sum, 1.0, rtol=0.0, atol=1e-12),
+    )
+    if not all(check.all() for check in checks):
+        raise RuntimeError("channel contribution totals do not reconcile to gold")
 
-def channel_breakdown(candidates: pd.DataFrame, sweep: pd.DataFrame,
-                      allocation_id: str) -> pd.DataFrame:
-    """Exact spend plus descriptive links to gold return and volatility."""
-    spend_cols = [c for c in candidates.columns if c.startswith("spend_")]
-    channels = [c.removeprefix("spend_") for c in spend_cols]
-    row = candidates.set_index("allocation_id").loc[allocation_id]
-    spend = row[spend_cols].to_numpy(float)
+    cell_meta = contrib[["allocation_id", "scenario_id", "n_paths", "seed",
+                         "total_spend"]].drop_duplicates()
+    if cell_meta.duplicated(["allocation_id", "scenario_id"]).any():
+        raise RuntimeError("one allocation/scenario has conflicting attribution lineage")
+    sweep_meta = sweep[["allocation_id", "scenario_id", "n_paths", "seed",
+                        "total_spend"]].rename(columns={
+                            "n_paths": "gold_n_paths", "seed": "gold_seed",
+                            "total_spend": "gold_total_spend",
+                        })
+    lineage = cell_meta.merge(
+        sweep_meta, on=["allocation_id", "scenario_id"], how="left", validate="one_to_one")
+    if (lineage.gold_n_paths.isna().any()
+            or not (lineage.n_paths.astype(int) == lineage.gold_n_paths.astype(int)).all()
+            or not (lineage.seed.astype(str) == lineage.gold_seed.astype(str)).all()
+            or not np.allclose(lineage.total_spend, lineage.gold_total_spend,
+                               rtol=0.0, atol=1e-6)):
+        raise RuntimeError("channel contribution lineage does not match sweep gold")
 
-    normal = (sweep[sweep.scenario_id == "normal"]
-              [["allocation_id", "mean_revenue", "std_revenue"]]
-              .drop_duplicates("allocation_id"))
-    portfolio = candidates[["allocation_id", *spend_cols]].merge(
-        normal, on="allocation_id", validate="one_to_one")
-    portfolio_total = portfolio[spend_cols].sum(axis=1).to_numpy(float)
-    if not np.all(np.isfinite(portfolio_total)) or np.any(portfolio_total <= 0.0):
-        raise RuntimeError("persisted candidate artifacts contain an invalid total spend")
-
-    rows = []
-    for col, channel, amount in zip(spend_cols, channels, spend):
-        shares = portfolio[col].to_numpy(float) / portfolio_total
-        rows.append({
-            "channel": channel,
-            "spend": amount,
-            "spend_pct": amount / spend.sum(),
-            "return_corr": float(np.corrcoef(
-                shares, portfolio["mean_revenue"].to_numpy(float))[0, 1]),
-            "risk_corr": float(np.corrcoef(
-                shares, portfolio["std_revenue"].to_numpy(float))[0, 1]),
-        })
-    return pd.DataFrame(rows)
+    run_ids = contrib.phase5_workflow_run_id.dropna().astype(int).unique()
+    methods = contrib.attribution_method.dropna().astype(str).unique()
+    if len(run_ids) != 1 or len(methods) != 1:
+        raise RuntimeError("channel contributions must have one Workflow run and method")
+    return int(run_ids[0]), methods[0]
 
 
 # ------------------------------------------------------------------ rendering
@@ -212,8 +191,6 @@ def parse_args(argv=None) -> argparse.Namespace:
         description="Render the Phase 6 report from verified Databricks outputs.")
     parser.add_argument("--catalog", default=DEFAULT_CATALOG,
                         help=f"Unity Catalog catalog (default: {DEFAULT_CATALOG})")
-    parser.add_argument("--phase5-job-id", type=int, default=DEFAULT_PHASE5_JOB_ID,
-                        help="Persisted Phase 5 Workflow job id")
     parser.add_argument("--output", type=pathlib.Path, default=DEFAULT_OUT,
                         help=f"HTML output path (default: {DEFAULT_OUT})")
     return parser.parse_args(argv)
@@ -241,19 +218,18 @@ def main(argv=None) -> None:
 
     w, wid = DA.open_session()
     wid = wid or resolve_warehouse_id(w)
-    sweep, front, recs = load(w, wid, gold)
+    sweep, front, recs, contrib = load(w, wid, gold)
     print(f"loaded gold: sweep {len(sweep)}  frontier {len(front)}  recs {len(recs)}")
+    contribution_run_id, attribution_method = validate_contributions(sweep, recs, contrib)
 
     total_budget, n_paths = report_run_shape(sweep)
 
     n_cand = sweep.allocation_id.nunique()
-    candidates, candidate_run_id = load_persisted_candidates(
-        w, sweep, catalog=catalog, phase5_job_id=args.phase5_job_id)
-    print(f"candidate vectors loaded from verified Phase 5 run {candidate_run_id}")
     top = recs[(recs.scenario_id == "normal")
+               & (recs.objective_pair == "mean_revenue vs std_revenue")
                & (recs.recommendation == "max_return")].iloc[0]
-    chan = channel_breakdown(candidates, sweep, top.allocation_id)
-    print(f"channel breakdown built for {top.allocation_id}")
+    chan = contribution_breakdown(contrib, top)
+    print(f"channel contributions loaded for {top.allocation_id}")
 
     # --- frontier sizes, straight from gold
     sizes = (front.groupby(["objective_pair", "scenario_id"])
@@ -283,8 +259,7 @@ def main(argv=None) -> None:
     splits = {}
     for _l, _w, _row, _r in tiers:
         if _row.allocation_id not in splits:
-            splits[_row.allocation_id] = channel_breakdown(
-                candidates, sweep, _row.allocation_id)
+            splits[_row.allocation_id] = contribution_breakdown(contrib, _row)
     print(f"channel splits built for {len(splits)} recommended allocations")
 
     n_ord = int(recs.ordering_unresolved.sum())
@@ -298,14 +273,14 @@ def main(argv=None) -> None:
     output.write_text(render(
         sweep, front, recs, sizes, tiers, sens, chan, top,
         n_cand, n_ord, n_floor, n_both, floor_front, floor_sweep, splits,
-        candidate_run_id, total_budget, n_paths,
+        contribution_run_id, attribution_method, total_budget, n_paths,
     ), encoding="utf-8")
     print(f"wrote {output}  ({output.stat().st_size:,} bytes)")
 
 
 def render(sweep, front, recs, sizes, tiers, sens, chan, top,
            n_cand, n_ord, n_floor, n_both, floor_front, floor_sweep, splits,
-           candidate_run_id, total_budget, n_paths) -> str:
+           contribution_run_id, attribution_method, total_budget, n_paths) -> str:
     from report_template import build  # keeps markup out of the query code
     return build(**locals())
 

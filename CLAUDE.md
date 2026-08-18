@@ -850,22 +850,26 @@ Structured to demonstrate three roles in one system:
   `spark.sql.adaptive.coalescePartitions.enabled` is REFUSED on serverless
   (`CONFIG_NOT_AVAILABLE`); `shuffle.partitions` is accepted.
 - **Phase 6 (Analysis & Reporting):** on branch `phase-6-analysis-reporting`
-  (branched off `phase-5-orchestration` at `accf127`). READ-ONLY over gold —
-  nothing re-simulated. `reporting/build_report.py` queries the three gold
+  (branched off `phase-5-orchestration` at `accf127`).
+  `reporting/build_report.py` queries four gold
   tables at render time and emits a self-contained HTML report for a budget
   decision-maker; `reporting/report_template.py` holds the markup so numbers
   and prose cannot drift into each other.
 
-  **ONE stated exception to "everything from gold":** the channel-level
-  breakdown needs per-channel spend and gold is at allocation grain, so
-  the report reads the exact stage-1/stage-2 candidate Parquets persisted by
-  the latest successful Phase 5 Workflow run. It accepts them only after their
-  971 candidate ids and persisted aggregate result metrics match live gold.
-  Both successful runs' candidate/result artifacts are byte-identical. No
-  candidate is regenerated, no RNG or simulation is called, and the report no
-  longer analytically recreates per-channel revenue. Return/risk links are
-  descriptive correlations between exact spend shares and gold's stored
-  allocation-level mean/std metrics. The footer states this boundary directly.
+  **Approved channel-attribution extension (2026-08-18):** the original three
+  gold tables were allocation-grain, so a strict channel contribution analysis
+  was impossible from their persisted schema. With explicit user approval,
+  `databricks/09_create_channel_contributions.py` adds the fourth gold table,
+  `recommendation_channel_contributions`, and
+  `simulation/load_channel_contributions.py` reruns only the 24 unique
+  allocation/scenario cells referenced by the 36 recommendations. It uses each
+  cell's original seed and path count plus exact candidate spends from matching
+  Phase 5 Workflow run 322037088744573. It rejects any aggregate
+  mean/std/VaR/CVaR/ROAS mismatch before writing and does not alter the existing
+  three gold tables. Expected contributions are channel path means; risk uses
+  Euler component volatility, Cov(channel,total)/Std(total). Both channel sums
+  are reconciled to authoritative gold. The report itself remains query-only:
+  no candidate generation, RNG or simulation is called during rendering.
 
   **LIVE GOLD DOES NOT MATCH THE FIGURES IN THE PHASE 6 BRIEF.** The brief said
   the mean-VaR/CVaR frontiers are "6 of 971 (~0.62%)". Live gold, in
@@ -886,14 +890,15 @@ Structured to demonstrate three roles in one system:
     `ref_dir0p3_079_c100_02` returns 0.83x under platform_algo_change and 0.90x
     in recession, against the aggressive pick's 1.60x and 1.74x. Least variable
     is not least likely to lose money — the report makes that its own callout.
-  - Revenue-seeking and risk-reducing weights differ. In `dir1_110`, paid_search
-    takes 47.0% of budget; across all 971 candidates its share has the strongest
-    positive association with both mean revenue (+0.67) and volatility (+0.82),
-    while video share has the strongest negative volatility link (-0.79).
-    These are compositional associations, not causal channel attribution.
+  - Revenue-seeking and risk-reducing weights differ. For `dir1_110`, the
+    report now shows each channel's exact spend, expected-revenue contribution,
+    Euler component volatility, and corresponding shares. The component risks
+    sum exactly to total portfolio standard deviation; negative components, if
+    present, are diversification benefits rather than impossible negative risk.
+    This is model-based attribution, not causal incrementality evidence.
   - The floored allocation makes the caveat concrete: video is funded at only
-    $1,128. The report deliberately assigns it no channel ROAS because the run
-    did not persist per-channel revenue and Phase 6 must not recompute it.
+    $1,128. Attribution can quantify its simulated contribution under the model,
+    but does not create empirical evidence below the historical spend floor.
   - Flags surfaced inline next to the numbers, never footnoted: 11 of 36 recs
     `ordering_unresolved`, 16 of 36 `extrapolation_floor_applied`, 0 both;
     50 of 519 frontier rows and 692 of 3,884 sweep rows floored. Flagged
@@ -935,8 +940,7 @@ Structured to demonstrate three roles in one system:
   false — a fifth pick that carries it is now displayed; (10) two totals for
   one allocation went unreconciled (closed form vs simulated, 0.11%).
 
-  **2026-08-18 strict-completion follow-up — VERIFIED FEASIBLE STATE; literal
-  item 4 remains blocked by the persisted schema.** A fresh audit
+  **2026-08-18 strict-completion follow-up.** A fresh audit
   against the literal Phase 6 prompt found two scope gaps despite the earlier
   numeric verifier pass: the HTML plotted only the four primary mean-variance
   views while merely describing mean-VaR and mean-CVaR, and the channel table
@@ -954,20 +958,25 @@ Structured to demonstrate three roles in one system:
   at 3,884 / 519 / 36 rows with 12 SVGs and reproduced byte-for-byte on a
   second run.
 
-  The final independent verifier PASSed the engineering and every available
+  The independent verifier PASSed the engineering and every then-available
   datum: exact 971 candidate / 3,884 result keys, max absolute gold-vs-Parquet
   difference 0.0 for mean/std/VaR/CVaR/ROAS, all 12 plot counts and memberships,
   all recommendation/sensitivity figures and flags, exact `dir1_110` spend, and
   all five return/risk correlations. It found no candidate RNG, simulation,
   frontier regeneration or analytic channel-revenue call in reporting.
-  It correctly leaves literal prompt compliance PARTIAL: no persisted table or
-  artifact contains per-channel revenue or component-risk output for the top
-  recommendation, and the exact spend vectors live in the verified Phase 5
-  candidate Parquets rather than the three gold tables. A true contribution
-  decomposition therefore requires either new persisted upstream output (and
-  its own verification) or permission to recompute it, which the Phase 6 prompt
-  expressly forbids. The HTML states the proxy and source boundary instead of
-  fabricating a stronger result.
+  It correctly left literal prompt compliance PARTIAL at that point because no
+  persisted output contained per-channel revenue or component risk.
+
+  **Resolved with explicit approval on 2026-08-18:** GitHub issue #5 records
+  that schema gap. The approved targeted loader now persists 180 rows (36
+  recommendations x 5 channels) in the fourth gold table after rerunning only
+  24 unique cells. Before reconciliation, maximum absolute differences from
+  existing gold were 2.33e-10 mean, 5.82e-11 std, 3.49e-10 VaR, 2.33e-10 CVaR,
+  and 4.44e-16 ROAS. The loader independently verifies persisted row/key counts
+  and that spend, spend share, expected revenue, revenue share, component
+  volatility and risk share all reconcile for every recommendation. The report
+  now queries this table and presents literal channel-level expected-revenue and
+  risk contribution for the top recommendation; the former proxy is removed.
 
   **2026-08-18 repository audit follow-up.** GitHub issues #1-#3 record three
   confirmed repository-level defects found after Phase 6: the public README
@@ -978,10 +987,12 @@ Structured to demonstrate three roles in one system:
   CLI options, validate budget/path count from live gold, compute candidate
   shares from each persisted row total, refresh the README through Phase 6,
   and add GitHub Actions plus nine credential-free pytest contracts. Local
-  verification: all Python sources compile, 9/9 tests pass, live gold remains
-  3,884 / 519 / 36, the candidate artifact still matches, and two consecutive
-  renders are byte-identical at SHA-256
-  `1FCE06EAB28A52091C3792E54D779B6B38300F51FE270E221FD3123AE66B7406`.
+  verification after the approved attribution extension: all Python sources
+  compile, 13/13 tests pass, live gold remains 3,884 / 519 / 36 plus 180
+  channel-contribution rows, the candidate artifact still matches, every
+  contribution group reconciles, and two consecutive renders are byte-identical
+  at SHA-256
+  `19A758EE91AA8D6F4B3CCE62ED03FC4E4BF4661DD601256CF236932CEB5D5223`.
 
   Published as a Claude artifact for viewing — NOT to Databricks; no HTML is
   written to any UC volume, the workspace tree or MLflow. NOT MERGED — the standing rule is that

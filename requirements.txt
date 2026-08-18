@@ -1,7 +1,7 @@
 # Local data generation (Phase 1, step 1)
 numpy>=1.26
 pandas>=2.1
-pyarrow>=14.0  # Phase 6 reads the exact persisted Phase 5 candidate Parquets
+pyarrow>=14.0  # approved Phase 6 attribution loader reads exact Phase 5 candidate Parquets
 
 # Databricks control plane: catalog/schema DDL, file upload, SQL execution
 # (Statement Execution API -- no cluster or databricks-connect required)

@@ -216,9 +216,8 @@ when only one action is intended.
 
 ## Phase 6 -- Analysis and report
 
-Phase 6 reads the verified gold results and the exact candidate Parquets from
-the matching successful Phase 5 run. It does not regenerate candidates or run
-Monte Carlo paths.
+Phase 6 renders only verified gold results. The report itself does not
+regenerate candidates or run Monte Carlo paths.
 
 ```bash
 python reporting/build_report.py
@@ -226,14 +225,29 @@ python reporting/build_report.py --help
 ```
 
 The generated self-contained report is
-`reporting/budget_allocation_report.html`. Catalog, Phase 5 job id, output path,
-budget, and path-count handling are explicit: deployment identifiers are CLI
-options, while budget and path count are validated from live gold.
+`reporting/budget_allocation_report.html`. Catalog and output path are CLI
+options; budget and path count are validated from live gold.
 
-Gold is allocation-grain and does not contain per-channel revenue or component
-risk. The report therefore presents exact channel spend plus descriptive links
-between channel share and gold-level return/risk, and says plainly that this is
-not causal contribution attribution.
+The original three gold tables were allocation-grain. With explicit approval
+to fill that schema gap, Phase 6 adds
+`gold.recommendation_channel_contributions`. Its loader reruns only the 24
+unique allocation/scenario cells referenced by the 36 recommendations, using
+each cell's original seed, path count and exact persisted Phase 5 spend vector.
+It rejects any mean/std/VaR/CVaR/ROAS mismatch before writing and leaves the
+existing three gold tables untouched:
+
+```bash
+python databricks/09_create_channel_contributions.py
+python simulation/load_channel_contributions.py --dry-run
+python simulation/load_channel_contributions.py
+python reporting/build_report.py
+```
+
+Expected-revenue contributions are channel path means. Risk uses Euler
+component volatility, `Cov(channel revenue, total revenue) / Std(total
+revenue)`. Channel components may be negative when a channel diversifies the
+portfolio, and their persisted sums reconcile to the authoritative gold mean
+and standard deviation for every recommendation.
 
 ## Offline checks
 
