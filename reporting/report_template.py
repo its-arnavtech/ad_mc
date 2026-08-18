@@ -114,7 +114,8 @@ svg{width:100%; height:auto; display:block;}
   font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
 .pt{fill:var(--dot);}
 .pt-front{fill:var(--accent);}
-.pt-flag{fill:none; stroke:var(--alarm); stroke-width:1.9;}
+.pt-floor{fill:none; stroke:var(--alarm); stroke-width:1.9;}
+.pt-ord{fill:none; stroke:var(--warn); stroke-width:1.9;}
 .legend{display:flex; flex-wrap:wrap; gap:14px; font-size:.775rem; color:var(--ink-2);}
 .legend i{display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px;
   vertical-align:middle;}
@@ -141,7 +142,7 @@ def chips(ordering: bool, floored: bool) -> str:
     return " ".join(out) or '<span class="chip chip-none">no caveats</span>'
 
 
-def scatter(sub, front_ids, risk_col, w=470, h=290):
+def scatter(sub, front_ids, risk_col, ordering_ids=(), w=470, h=290):
     pad_l, pad_b, pad_t, pad_r = 56, 32, 10, 10
     xs = sub[risk_col].to_numpy(float)
     ys = sub["mean_revenue"].to_numpy(float)
@@ -150,13 +151,17 @@ def scatter(sub, front_ids, risk_col, w=470, h=290):
     px = lambda v: round(pad_l + (v - x0) / xr * (w - pad_l - pad_r), 1)
     py = lambda v: round(h - pad_b - (v - y0) / yr * (h - pad_b - pad_t), 1)
 
-    base, fr, fl = [], [], []
+    base, fr, fl, unresolved = [], [], [], []
     for aid, x, y, flag in zip(sub.allocation_id, xs, ys, sub.extrapolation_floor_applied):
         t = (px(x), py(y))
         if aid in front_ids:
-            (fl if flag else fr).append(t)
+            fr.append(t)
         else:
             base.append(t)
+        if flag:
+            fl.append(t)
+        if aid in ordering_ids:
+            unresolved.append(t)
 
     def dots(pts, cls, r):
         return "".join(f'<circle class="{cls}" cx="{a}" cy="{b}" r="{r}"/>' for a, b in pts)
@@ -171,9 +176,16 @@ def scatter(sub, front_ids, risk_col, w=470, h=290):
         gx = round(pad_l + f * (w - pad_l - pad_r), 1)
         g.append(f'<text class="tick" x="{gx}" y="{h-pad_b+16}" text-anchor="middle">'
                  f'{(x0 + f*xr)/1e3:.0f}k</text>')
+    def squares(pts, cls, r):
+        return "".join(
+            f'<rect class="{cls}" x="{a-r}" y="{b-r}" width="{2*r}" height="{2*r}"/>'
+            for a, b in pts
+        )
+
     return (f'<svg viewBox="0 0 {w} {h}" role="img">' + "".join(g)
             + dots(base, "pt", 1.7) + dots(fr, "pt-front", 3.3)
-            + dots(fl, "pt-flag", 3.6) + "</svg>")
+            + dots(fl, "pt-floor", 3.8) + squares(unresolved, "pt-ord", 4.2)
+            + "</svg>")
 
 
 def build(*, sweep, front, recs, sizes, tiers, sens, chan, corr, ch, top,
@@ -189,6 +201,11 @@ def build(*, sweep, front, recs, sizes, tiers, sens, chan, corr, ch, top,
     var_hi = max(sz[("mean_revenue vs var_95", s)] for s in SCEN_ORDER)
     cv_lo = min(sz[("mean_revenue vs cvar_95", s)] for s in SCEN_ORDER)
     cv_hi = max(sz[("mean_revenue vs cvar_95", s)] for s in SCEN_ORDER)
+
+    def ordering_ids(pair, scenario):
+        return set(recs[(recs.objective_pair == pair)
+                        & (recs.scenario_id == scenario)
+                        & recs.ordering_unresolved].allocation_id)
 
     # ---------------------------------------------------------------- header
     add(f"""<header class="head">
@@ -236,7 +253,8 @@ removed.</p>""")
     add('<div class="legend"><span><i style="background:var(--dot)"></i>dominated</span>'
         '<span><i style="background:var(--accent)"></i>efficient</span>'
         '<span><i style="border:2px solid var(--alarm);background:transparent"></i>'
-        'efficient, priced at floor</span></div>')
+        'priced at floor</span><span><i style="border:2px solid var(--warn);'
+        'background:transparent;border-radius:1px"></i>ordering unresolved</span></div>')
 
     add('<div class="grid2">')
     for s in SCEN_ORDER:
@@ -245,7 +263,7 @@ removed.</p>""")
         add(f"""<div class="card"><h3>{SCEN_LABEL[s]}</h3>
 <p class="axis">Expected revenue (vertical) vs volatility (horizontal). Up and to the left is better.
 <strong>{sz[(mv,s)]} of {n_cand:,}</strong> efficient.</p>
-{scatter(sub, fids, "std_revenue")}</div>""")
+{scatter(sub, fids, "std_revenue", ordering_ids(mv, s))}</div>""")
     add("</div>")
 
     add(f"""<div class="callout"><h3>Two frontiers, and only one of them is a real curve</h3>
@@ -261,6 +279,33 @@ secretly the same thing. We tested that specific explanation and it did not hold
 worst-case frontiers as <em>a few defensible options</em>, and use the volatility frontier when
 you want to see the shape of the trade-off.</p>
 </div>
+
+<h3>Downside-risk views: mean&ndash;VaR and mean&ndash;CVaR</h3>
+<p class="measure">These plots show the two thin downside-risk frontiers rather than hiding
+them. Teal points are the efficient handfuls. Their thinness is expected sampling behaviour,
+not evidence of collinearity or a special structural relationship.</p>
+<div class="grid2">""")
+    for s in SCEN_ORDER:
+        sub = sweep[sweep.scenario_id == s]
+        pair_var = "mean_revenue vs var_95"
+        pair_cvar = "mean_revenue vs cvar_95"
+        var_ids = set(front[(front.scenario_id == s)
+                            & (front.objective_pair == pair_var)].allocation_id)
+        cvar_ids = set(front[(front.scenario_id == s)
+                             & (front.objective_pair == pair_cvar)].allocation_id)
+        add(f"""<div class="card"><h3>{SCEN_LABEL[s]}</h3>
+<p class="axis"><strong>Mean&ndash;VaR:</strong> {sz[(pair_var,s)]} of {n_cand:,} efficient.
+Up and to the right is better.</p>
+{scatter(sub, var_ids, "var_95", ordering_ids(pair_var, s), h=240)}
+<p class="axis"><strong>Mean&ndash;CVaR:</strong> {sz[(pair_cvar,s)]} of {n_cand:,} efficient.
+Up and to the right is better.</p>
+{scatter(sub, cvar_ids, "cvar_95", ordering_ids(pair_cvar, s), h=240)}</div>""")
+    add("</div>")
+
+    add("""<p class="measure axis">For VaR and CVaR, farther right means a higher revenue floor
+in bad outcomes, so right is safer. Outlines retain both caveats directly in every plot: red
+circles mark allocations priced at the historical spend floor; amber squares mark a displayed
+recommendation whose ordering against a neighbour is unresolved.</p>
 </section>""")
 
     # -------------------------------------------------------- recommendations
@@ -377,31 +422,39 @@ change; {below_thresh} of {n_cand:,} candidates are.</p>
 highest-expected-revenue allocation on the frontier.</p>
 <div class="scroll"><table>
 <thead><tr><th>Channel</th><th>Spend</th><th>Share</th><th>Expected revenue</th>
-<th>Share</th><th>Return</th><th>Saturates at</th><th></th></tr></thead><tbody>""")
+<th>Share</th><th>Return</th><th>Risk link</th><th>Saturates at</th><th></th></tr></thead><tbody>""")
     for r in chan.itertuples():
         flag = ('<span class="chip chip-floor">priced at floor</span>'
                 if r.floored else "")
         add(f"""<tr><td>{r.channel}</td><td>{money(r.spend)}</td>
 <td>{100*r.spend_pct:.1f}%</td><td>{money(r.revenue)}</td>
 <td>{100*r.revenue_pct:.1f}%</td><td>{r.roas:.2f}&times;</td>
-<td>{r.theta:.3f}</td><td style="text-align:left">{flag}</td></tr>""")
+<td>{r.risk_corr:+.2f}</td><td>{r.theta:.3f}</td>
+<td style="text-align:left">{flag}</td></tr>""")
     add(f"""<tr class="total"><td>Total</td><td>{money(chan.spend.sum())}</td><td>100.0%</td>
 <td>{money(chan.revenue.sum())}</td><td>100.0%</td>
-<td>{chan.revenue.sum()/chan.spend.sum():.2f}&times;</td><td></td><td></td></tr>
+<td>{chan.revenue.sum()/chan.spend.sum():.2f}&times;</td><td></td><td></td><td></td></tr>
 </tbody></table></div>""")
 
+    risk_up = chan.loc[chan.risk_corr.idxmax()]
+    risk_down = chan.loc[chan.risk_corr.idxmin()]
     add(f"""<div class="stack measure">
 <p><strong>Revenue is concentrated; diversification is not.</strong>
 {rev_lead.channel} takes {100*rev_lead.spend_pct:.0f}% of the budget and produces
-{100*rev_lead.revenue_pct:.0f}% of expected revenue. But the channels that reduce risk are
-different ones: conversion rates across {tight[1]} and {tight[2]} move together most tightly
-(correlation {tight[0]:.2f}), while <strong>{ch[least]}</strong> is the least correlated with
-everything else, and across all {n_cand:,} tested allocations a larger {ch[least]} share does go
-with a steadier outcome. <em>The honest caveat:</em> {ch[least]} is also the least variable
-channel on its own, so low correlation and low own-variance are tangled together here and the
-correlation table alone cannot separate them. The model also correlates only conversion rates
-&mdash; click costs and order values are drawn independently &mdash; so this table describes one
-of three sources of uncertainty, not all of it.</p>
+{100*rev_lead.revenue_pct:.0f}% of expected revenue. The <strong>risk link</strong> is independently
+grounded in the stored gold sweep: across all {n_cand:,} normal-scenario allocations, a larger
+{risk_up.channel} share has the strongest association with more volatility
+(correlation {risk_up.risk_corr:+.2f}), while a larger {risk_down.channel} share has the strongest
+association with less volatility ({risk_down.risk_corr:+.2f}). That makes the distinction
+visible channel by channel instead of treating expected revenue as a proxy for risk.</p>
+<p><em>The honest caveat:</em> this is an association across candidate portfolios, not a causal
+risk attribution; budget shares must add to 100%, so raising one always lowers another.
+Conversion rates across {tight[1]} and {tight[2]} move together most tightly
+(correlation {tight[0]:.2f}), while <strong>{ch[least]}</strong> is least correlated with the
+others. But own-variance and cross-channel correlation are tangled together here, and the model
+correlates only conversion rates &mdash; click costs and order values are drawn independently.
+The risk link therefore shows which channel weights travel with portfolio volatility in gold,
+not how much volatility a channel causes by itself.</p>
 <p>"Saturates at" is how quickly a channel gets more expensive as you push budget into it, on a
 0-to-1 scale: 0 means cost never rises, and higher numbers mean it rises faster. At 0.352,
 doubling spend on paid search raises its cost per click by about 28%; at 0.120, display rises

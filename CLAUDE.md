@@ -934,6 +934,19 @@ Structured to demonstrate three roles in one system:
   false — a fifth pick that carries it is now displayed; (10) two totals for
   one allocation went unreconciled (closed form vs simulated, 0.11%).
 
+  **2026-08-18 strict-completion follow-up — IN PROGRESS.** A fresh audit
+  against the literal Phase 6 prompt found two scope gaps despite the earlier
+  numeric verifier pass: the HTML plotted only the four primary mean-variance
+  views while merely describing mean-VaR and mean-CVaR, and the channel table
+  quantified revenue contribution but described risk only qualitatively. The
+  source now renders all 12 scenario/objective views (mean-variance remains
+  primary) and preserves both caveat types as plot outlines. It also adds a
+  per-channel risk link: correlation between reconstructed channel share and
+  the stored normal-scenario `std_revenue` across all gold candidates. This is
+  labelled descriptive, compositional and non-causal; no paths are drawn and
+  no result is re-simulated. Live re-render and the new independent verifier
+  pass are still pending before this follow-up can be called complete.
+
   Published as a Claude artifact for viewing — NOT to Databricks; no HTML is
   written to any UC volume, the workspace tree or MLflow. NOT MERGED — the standing rule is that
   the merge is the user's call, and it has been put to them rather than assumed.

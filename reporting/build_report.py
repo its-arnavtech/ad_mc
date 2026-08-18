@@ -152,6 +152,28 @@ def channel_breakdown(w, wid, sweep: pd.DataFrame, allocation_id: str):
         spend / spend.sum(), inputs, normal, per_channel=True)
     theta = SAT.theta_vector(ch, dict(SAT.DEFAULT_THETA))
     floor = SAT.spend_floor_vector(ch)
+
+    # Gold has no channel-level risk decomposition, so do not invent one from
+    # fresh paths.  Instead, quantify the observable portfolio-design link:
+    # across the verified normal-scenario sweep, how strongly is each
+    # channel's reconstructed budget share associated with gold's stored
+    # allocation-level volatility?  This is descriptive, not causal, and the
+    # report labels it that way.
+    normal_risk = (sweep[sweep.scenario_id == "normal"]
+                   [["allocation_id", "std_revenue"]]
+                   .drop_duplicates("allocation_id")
+                   .set_index("allocation_id"))
+    risk_corr = {}
+    for i, c in enumerate(ch):
+        aligned = normal_risk.loc[normal_risk.index.intersection(cands)]
+        shares = np.array([
+            cands[aid].spend[i] / sum(cands[aid].spend)
+            for aid in aligned.index
+        ], dtype=float)
+        risk_corr[c] = float(np.corrcoef(
+            shares, aligned["std_revenue"].to_numpy(float)
+        )[0, 1])
+
     rows = []
     for i, c in enumerate(ch):
         rows.append({
@@ -160,6 +182,7 @@ def channel_breakdown(w, wid, sweep: pd.DataFrame, allocation_id: str):
             "roas": per[i] / spend[i] if spend[i] > 0 else float("nan"),
             "theta": theta[i], "floor": floor[i],
             "floored": bool(0.0 < spend[i] < floor[i]),
+            "risk_corr": risk_corr[c],
         })
     return pd.DataFrame(rows), inputs.correlation, ch
 
