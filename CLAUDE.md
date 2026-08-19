@@ -32,21 +32,27 @@ main was fast-forwarded past its head). Every phase kept its committed SHA:
 | 5 — Orchestration | `accf127` | Persisted Workflow job `94493651519110`, one MLflow run per job run |
 | 6 — Analysis & Reporting | `3ee1b9c` | Live-gold-backed HTML report + 4th gold table + regression tests + CI |
 
-Final `main` HEAD: **`3ee1b9c`** (also the tip of `phase-6-analysis-reporting`).
+Merge tip on `main`: **`3ee1b9c`**, identical to the tip of
+`phase-6-analysis-reporting`. This CLAUDE.md summary sits one commit further on
+top of the merge, so a reader today sees `main` at that summary commit rather
+than at `3ee1b9c` — nothing before it has been rewritten.
 
-Post-merge verification (2026-08-19):
+Post-merge verification (2026-08-19, independent verifier pass):
 - `main` fast-forwarded from `1ad64d1` to `3ee1b9c`; PR #4 auto-closed as MERGED with merge commit = `3ee1b9c`
-- 13 pytest contracts pass against `main` HEAD
-- GitHub Actions "Python checks" workflow ran on the merge push (run `32303819281`, success in 46s)
-- Live gold spot-check against Databricks matches every headline figure the report shows
-- Full-history secret scan across all 51 files reachable from main: zero hits
-- Every phase branch is reachable from `main` and therefore safe to delete; branches left in place per instruction
+- Topology: `main`'s history is fully linear, every commit has exactly one parent — no synthetic merge commit
+- 13 pytest contracts pass against `main` HEAD (recomputed in a worktree pinned to the summary commit)
+- GitHub Actions "Python checks" ran and succeeded on the merge push (run `32303819281`, 46s) AND on the summary-commit push (run `32304081142`, 43s) — both green
+- Live gold spot-check against Databricks matches every headline figure the report shows (best normal `$1,054,690.6952`; frontier sizes 6/7/8/9, 8/8/9/11, 107/109/114/123; 11/16 recs flagged; 180 contribution rows)
+- Full-history secret scan across all 51 files reachable from main: zero hits across databricks / AWS / GitHub / Slack tokens, PEM headers, and inline literal assignments
+- Every one of the eight phase branches is reachable from `main` and therefore safe to delete; branches left in place per instruction
 
-The six phase branches are preserved (`phase-1-data-foundation`, `phase-2-simulation-engine`,
-`phase-3-distributed-simulation`, `phase-4-saturation-curve`, `phase-4-optimization`,
-`phase-4-spend-floor`, `phase-5-orchestration`, `phase-6-analysis-reporting`) as the
-per-phase record; they are all ancestors of `main` and can be deleted safely
-whenever the owner chooses.
+**Eight branches** hold the phase record — Phase 4 is split into a saturation
+prerequisite, an optimization sweep, and a spend-floor follow-up:
+`phase-1-data-foundation`, `phase-2-simulation-engine`,
+`phase-3-distributed-simulation`, `phase-4-saturation-curve`,
+`phase-4-optimization`, `phase-4-spend-floor`, `phase-5-orchestration`,
+`phase-6-analysis-reporting`. All are ancestors of `main` and can be deleted
+safely whenever the owner chooses.
 
 Everything below this line is the phase-by-phase build log kept during
 development — retained so the reasoning trail (verifier findings, prose
