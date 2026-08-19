@@ -13,6 +13,46 @@ Structured to demonstrate three roles in one system:
 - **Data Science** — stochastic simulation design, correlated Monte Carlo modeling, allocation optimization, MLflow tracking
 - **Data Analysis** — exploration, visualization, risk/return recommendation reporting
 
+## Project complete (2026-08-19)
+
+All six phases plus the two mid-phase modeling fixes are merged into `main` by
+fast-forward on 2026-08-19, via PR
+[#4](https://github.com/its-arnavtech/ad_mc/pull/4) (auto-closed as MERGED when
+main was fast-forwarded past its head). Every phase kept its committed SHA:
+
+| phase | tip commit | what it delivered |
+|---|---|---|
+| 1 — Data Foundation | `39c750c` | Bronze Delta tables: channel history, assumptions, revenue correlation |
+| 2 — Simulation Engine | `43c9163` | Single-node correlated Monte Carlo, Jensen-validated |
+| CVR correlation fix | `bcfeba3` | Dedicated `channel_cvr_correlation_matrix`, engine rewired to it |
+| 3 — Distributed Batch | `bfc3b46` | Wheel + `applyInPandas` on serverless, 840,000 silver rows |
+| 4 prerequisite — Saturation | `28f0d62` | Spend-elasticity curve anchored at $100k, opt-in; anchor bitwise |
+| 4 — Optimization Sweep | `9df9c1c` | 971 candidates × 4 scenarios × 10,000 paths = 38.84M paths, gold populated |
+| 4 follow-up — Spend Floor | `a289016` | p5 daily-spend floor on the CPC curve, `extrapolation_floor_applied` flag |
+| 5 — Orchestration | `accf127` | Persisted Workflow job `94493651519110`, one MLflow run per job run |
+| 6 — Analysis & Reporting | `3ee1b9c` | Live-gold-backed HTML report + 4th gold table + regression tests + CI |
+
+Final `main` HEAD: **`3ee1b9c`** (also the tip of `phase-6-analysis-reporting`).
+
+Post-merge verification (2026-08-19):
+- `main` fast-forwarded from `1ad64d1` to `3ee1b9c`; PR #4 auto-closed as MERGED with merge commit = `3ee1b9c`
+- 13 pytest contracts pass against `main` HEAD
+- GitHub Actions "Python checks" workflow ran on the merge push (run `32303819281`, success in 46s)
+- Live gold spot-check against Databricks matches every headline figure the report shows
+- Full-history secret scan across all 51 files reachable from main: zero hits
+- Every phase branch is reachable from `main` and therefore safe to delete; branches left in place per instruction
+
+The six phase branches are preserved (`phase-1-data-foundation`, `phase-2-simulation-engine`,
+`phase-3-distributed-simulation`, `phase-4-saturation-curve`, `phase-4-optimization`,
+`phase-4-spend-floor`, `phase-5-orchestration`, `phase-6-analysis-reporting`) as the
+per-phase record; they are all ancestors of `main` and can be deleted safely
+whenever the owner chooses.
+
+Everything below this line is the phase-by-phase build log kept during
+development — retained so the reasoning trail (verifier findings, prose
+corrections, motivated-reasoning caveats) is not lost. The tables above are
+the compact story; this is the receipts.
+
 ## Current status
 
 - **Phase 1 (Data Foundation):** complete, committed (`39c750c`) on branch
