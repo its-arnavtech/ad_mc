@@ -992,7 +992,16 @@ Structured to demonstrate three roles in one system:
   channel-contribution rows, the candidate artifact still matches, every
   contribution group reconciles, and two consecutive renders are byte-identical
   at SHA-256
-  `19A758EE91AA8D6F4B3CCE62ED03FC4E4BF4661DD601256CF236932CEB5D5223`.
+  `BDF3B00D5E2A1FEF82DCBBA25F9C216E1610E9D9A62F7305AA4E8F655A00A94E`.
+
+  **Two small residual defects the earlier verifier had flagged are now
+  closed.** The rendered HTML now carries `<meta charset="utf-8">` and the one
+  remaining raw em-dash in the source (the "Balanced" tier's caption) is
+  entified, so the file opens correctly from disk under a cp1252 default rather
+  than mojibaking on Windows. Live re-render is byte-identical to the disk copy
+  and non-ASCII byte count is zero. The predecessor SHA
+  `19A758EE91AA8D6F4B3CCE62ED03FC4E4BF4661DD601256CF236932CEB5D5223` is what
+  was measured before this pair of cosmetic fixes; no gold data changed.
 
   Published as a Claude artifact for viewing — NOT to Databricks; no HTML is
   written to any UC volume, the workspace tree or MLflow. NOT MERGED — the standing rule is that

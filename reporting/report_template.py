@@ -537,6 +537,10 @@ loader rejected any aggregate mismatch before writing and reconciled channel sum
 authoritative allocation-level gold mean and volatility.</p>
 </div>""")
 
-    return (f'<title>Budget Allocation Under Uncertainty</title>\n'
+    # meta charset is emitted here rather than left to the Artifact wrapper,
+    # so opening the file directly from disk on a cp1252 default (Windows) does
+    # not mojibake the one raw em-dash the doc happens to contain.
+    return (f'<meta charset="utf-8">\n'
+            f'<title>Budget Allocation Under Uncertainty</title>\n'
             f"<style>{CSS}</style>\n"
             f'<div class="wrap">' + "\n".join(P) + "</div>")

@@ -245,7 +245,7 @@ def main(argv=None) -> None:
     PAIR_VAR = "mean_revenue vs var_95"
     tiers = [
         ("Conservative", "Lowest volatility on the frontier", pick(PAIR_MV, "min_risk"), "std_revenue"),
-        ("Balanced", "The knee — where extra return stops paying for itself", pick(PAIR_MV, "balanced"), "std_revenue"),
+        ("Balanced", "The knee &mdash; where extra return stops paying for itself", pick(PAIR_MV, "balanced"), "std_revenue"),
         ("Aggressive", "Highest expected revenue on the frontier", pick(PAIR_MV, "max_return"), "std_revenue"),
         ("Floor-protective", "Highest worst-case floor (VaR-95)", pick(PAIR_VAR, "min_risk"), "var_95"),
         ("Balanced, worst-case view", "The knee of the worst-case frontier",
